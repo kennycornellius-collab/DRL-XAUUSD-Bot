@@ -1,0 +1,7 @@
+model1/
+
+models/
+
+tensorboard_logs/
+
+venv/
