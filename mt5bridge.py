@@ -232,7 +232,7 @@ def main():
                 if target_pos != 0:
                     execute_market_order(target_pos)
             else:
-                print("💤 No change required. Holding state.")
+                print("No change required. Holding state.")
 
         except KeyboardInterrupt:
             print("\nShutting down DRL Bot...")
