@@ -7,11 +7,12 @@ A Deep Reinforcement Learning trading agent for Gold (XAUUSD) on the M15 timefra
 ---
 
 ## Overview
+Most DRL trading projects train once on a fixed historical window and call it done. This project takes a different approach — it uses a rolling walk-forward training loop that continuously fine-tunes the agent week-by-week on fresh out-of-sample data, mimicking how a real adaptive system would behave in a live market.
 
-Most DRL trading projects train once on a fixed historical window and call it done. This project takes a different approach — it uses a **rolling walk-forward training loop** that continuously fine-tunes the agent week-by-week on fresh out-of-sample data, mimicking how a real adaptive system would behave in a live market.
+The agent trades Gold (XAUUSD) on the M15 timeframe using Soft Actor-Critic (SAC) with a continuous action space, operating on a compact 9-dimensional observation vector that combines normalized market features with live account state — unrealized PnL and current drawdown. A custom WeeklyRollingBuffer ensures the agent only trains on recent market regimes by purging the oldest week's experience at each rollover, preventing it from overfitting to stale conditions.
 
-The agent operates on a compact **9-dimensional observation vector** instead of raw price sequences, combining normalized market features with live account state.
-
+Reward shaping uses a Sortino-like ratio with an explicit drawdown penalty, and a 20% drawdown hard stop terminates episodes early — building capital preservation directly into the training objective rather than treating it as an afterthought.
+Hyperparameter experiments revealed the model is highly sensitive to the number of gradient steps per fine-tuning cycle. Too few and the agent underfits; too many and it overfits aggressively to the current week and collapses on the next. The best configuration achieved +24.65% net profit over the out-of-sample walk-forward period with an 11% max drawdown — though generalizing consistently across different market regimes remains an open problem.
 ---
 
 ## Architecture
