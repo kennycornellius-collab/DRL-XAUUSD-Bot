@@ -24,10 +24,11 @@ This bot is part of a three-repository automated system. The scraper and macro a
 
 ```
 [forex-news-scraper]          (GitHub Actions — runs every Monday)
-  Scrapes ForexFactory → filters high impact USD events → passes data to macro analyzer
+  Scrapes ForexFactory → filters high impact USD events → commits filtered high impact USD events to repository
        │
        ▼
 [macro-analyzer]              (GitHub Actions — runs every Monday)
+  Pulls the filtered high impact data from news scraper repo
   Sends filtered events to Gemini API → outputs regime.json with expected_volatility field
   Commits regime.json to repository
        │
