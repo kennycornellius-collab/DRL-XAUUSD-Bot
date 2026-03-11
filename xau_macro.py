@@ -41,7 +41,8 @@ def prepare_data(csv_path: str) -> pd.DataFrame:
         'high': 'max',
         'low': 'min',
         'close': 'last',
-        'volume': 'sum'
+        'volume': 'sum',
+        'high_impact_news': 'max'
     }
     
     df_m15 = df_m5.resample('15min', closed='left', label='left').agg(agg_dict)
@@ -69,7 +70,7 @@ class XAUEnv(gym.Env):
         self.df = df.reset_index(drop=True)
         self.max_steps = len(self.df) - 1
 
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(9,), dtype=np.float32)
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(10,), dtype=np.float32)
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
@@ -136,7 +137,14 @@ class XAUEnv(gym.Env):
 
         step_pnl = self.position * (next_close - current_close)
         step_return = step_pnl - spread_cost
+
+        current_news_flag = self.df.iloc[self.current_step - 1]['high_impact_news']
         
+        macro_penalty = 0.0
+        if current_news_flag == 1:
+            if new_pos != 0 and new_pos != self.position:
+                macro_penalty = 2.0
+
         self.returns_50.append(step_return)
         self.balance += step_return
         
@@ -151,6 +159,8 @@ class XAUEnv(gym.Env):
         reward = step_return / (downside_std + 1e-8)
         if self.current_dd > 0.05:
             reward -= 0.5 * self.current_dd
+
+        reward -= macro_penalty
 
         self.position = new_pos
         
@@ -192,7 +202,8 @@ class XAUEnv(gym.Env):
         ur_pnl = np.clip(self.current_unrealized_pnl / 100.0, -1.0, 1.0)
         dd = np.clip(self.current_dd, -1.0, 1.0)
 
-        return np.concatenate([scaled, [pos, ur_pnl, dd]]).astype(np.float32)
+        news_flag = float(self.df.iloc[self.current_step]['high_impact_news'])
+        return np.concatenate([scaled, [pos, ur_pnl, dd, news_flag]]).astype(np.float32)
 
 
 class WeeklyRollingBuffer(ReplayBuffer):
@@ -385,5 +396,5 @@ def generate_dummy_csv(path="dummy_xauusd.csv"):
     return path
 
 if __name__ == "__main__":
-    test_csv = "data/data.csv"
+    test_csv = "data/data_merged.csv"
     run_wfo_pipeline(test_csv)
