@@ -5,3 +5,5 @@ models/
 tensorboard_logs/
 
 venv/
+
+data/
