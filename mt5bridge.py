@@ -44,6 +44,17 @@ def send_discord_alert(message, is_alert=False):
     except: 
         pass
 
+def fetch_macro_regime():
+    url = "https://raw.githubusercontent.com/kennycornellius-collab/AI-Macro-Analyst/main/regime.json"
+    try:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            regime_data = response.json()
+            return regime_data.get('expected_volatility', 'Unknown')
+    except Exception as e:
+        print(f"Failed to fetch macro regime: {e}")
+    
+    return "Unknown"
 
 def get_drl_observation():
     global PEAK_BALANCE
@@ -66,7 +77,7 @@ def get_drl_observation():
     
     hist_df = df[['open', 'high', 'low', 'close', 'volume', 'adx']].tail(200)
     if len(hist_df) < 200:
-        print("Not enough clean data. Waiting...")
+        print("Not enough clean data. Waiting")
         return None
         
     hist = hist_df.values.astype(np.float32)
@@ -183,12 +194,12 @@ def main():
         print(f"Model file not found at {MODEL_PATH}")
         sys.exit()
         
-    print(f"Loading SAC Agent...")
+    print(f"Loading SAC Agent")
     model = SAC.load(MODEL_PATH)
     send_discord_alert("**DRL Bot Online & Monitoring M15 Candles**")
 
     last_candle_time = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 1)[0]['time']
-    print("Waiting for the close of the current 15m candle to start execution...")
+    print("Waiting for the close of the current 15m candle to start execution")
 
     while True:
         try:
@@ -202,7 +213,7 @@ def main():
                 
             last_candle_time = current_candle_time
             now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"\n[{now_str}] New M15 Candle Formed. Calculating DRL State...")
+            print(f"\n[{now_str}] New M15 Candle Formed. Calculating DRL State")
 
             state_data = get_drl_observation()
             if state_data is None: continue
@@ -221,7 +232,13 @@ def main():
             else:
                 target_pos = 0
                 action_str = "HOLD/FLAT"
-                
+            
+            current_volatility = fetch_macro_regime()
+            if current_volatility in ["High", "Extreme"]:
+                print(f"MACRO OVERRIDE: {current_volatility} volatility expected. Forcing FLAT position.")
+                target_pos = 0
+                action_str = "CIRCUIT_BREAKER_FLAT"
+
             print(f"NN Action Value: {act_val:+.3f} -> Target: {action_str} | Current: {current_pos}")
 
             if target_pos != current_pos:
@@ -235,7 +252,7 @@ def main():
                 print("No change required. Holding state.")
 
         except KeyboardInterrupt:
-            print("\nShutting down DRL Bot...")
+            print("\nShutting down DRL Bot")
             send_discord_alert("**DRL Bot Manually Shut Down**")
             mt5.shutdown()
             sys.exit()
