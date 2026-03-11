@@ -1,6 +1,6 @@
 # DRL XAUUSD Trading Bot
 
-A Deep Reinforcement Learning trading agent for Gold (XAUUSD) on the M15 timeframe, built using **Soft Actor-Critic (SAC)** and trained with a custom **Walk-Forward Optimization (WFO)** pipeline. Includes a live execution bridge via MetaTrader 5.
+A Deep Reinforcement Learning trading agent for Gold (XAUUSD) on the M15 timeframe, built using **Soft Actor-Critic (SAC)** and trained with a custom **Walk-Forward Optimization (WFO)** pipeline. Includes a live execution bridge via MetaTrader 5 and a synchronized Macroeconomic Risk Circuit Breaker.
 
 > **Disclaimer:** This project is for educational and portfolio purposes only. It is not financial advice and should not be used with real capital without thorough due diligence.
 
@@ -18,32 +18,61 @@ Hyperparameter experiments revealed the model is highly sensitive to the number 
 
 ---
 
-## Multi-Repo Integration
+## Multi-Repo Ecosystem
 
-This bot is part of a three-repository automated system. The scraper and macro analyzer each run independently on their own GitHub Actions schedules, feeding the bot a fresh risk assessment every week without any manual intervention.
+This bot is the execution layer of a three-repository automated quantitative system. The data extraction and sentiment analysis layers run independently via cloud automation, feeding this bot a fresh risk assessment without any manual intervention.
 
 ```
 [forex-news-scraper]          (GitHub Actions — runs every Monday)
-  Scrapes ForexFactory → filters high impact USD events → commits filtered high impact USD events to repository
+  Scrapes ForexFactory → filters high impact USD events → commits CSV to repository
        │
        ▼
-[macro-analyzer]              (GitHub Actions — runs every Monday)
-  Pulls the filtered high impact data from news scraper repo
-  Sends filtered events to Gemini API → outputs regime.json with expected_volatility field
-  Commits regime.json to repository
+[macro-analyzer]              (GitHub Actions — runs every Monday @ 00:30 UTC)
+  Pulls filtered data from Repo 1
+  Sends events to Google Gemini API → outputs regime.json with expected_volatility
+  Commits regime.json to repository & broadcasts to Discord
        │
        ▼ (fetched via GitHub raw URL before each M15 candle decision)
 [drl-xauusd]                  (this repository)
   Reads expected_volatility → if "High" or "Extreme" → CIRCUIT_BREAKER_FLAT
 ```
 
-### Macro Circuit Breaker
+---
 
-After computing the DRL action each candle, the MT5 bridge fetches the latest `regime.json` from the macro analyzer repository and reads the `expected_volatility` field. If the value is `"High"` or `"Extreme"`, the bridge overrides the agent's decision and forces a flat position regardless of what the neural network outputs — no new trades are opened.
+## The Macro Circuit Breaker
 
-This addresses one of the most well-known failure modes of algorithmic trading systems. Economic news releases cause sharp, unpredictable price spikes that violate the statistical patterns the agent was trained on. Rather than trying to train the agent to handle these events — which are rare, high-variance, and difficult to generalize from — the circuit breaker simply keeps the bot out of the market during those windows entirely.
+One of the most well-known failure modes of algorithmic trading is the inability to navigate unpredictable economic news releases (CPI, FOMC, NFP). These events cause sharp, erratic price spikes that violate the statistical patterns the agent was trained on.
+
+After computing the DRL action each candle, the MT5 bridge fetches the latest `regime.json` from the macro analyzer repository. If the `expected_volatility` is `"High"` or `"Extreme"`, the bridge overrides the neural network's decision and forces a flat position.
 
 The check runs on every M15 candle close, not just at startup. If the macro regime updates mid-session, the bot will pick it up on the next candle.
+
+---
+
+## Experiment: State-Space Macro Integration
+
+**Hypothesis:** If the agent is penalized for holding trades during high-impact news windows during training, it will learn to organically flatten its position and avoid volatility spikes — producing a higher risk-adjusted return than a deterministic circuit breaker.
+
+**Methodology:**
+- Sourced historical Forex Factory data (2023–present) via Hugging Face.
+- Built `merge_news.py` to convert timezones to UTC, filter for USD high-impact events, and merge a boolean `news_flag` into the M5/M15 OHLCV dataset.
+- Expanded the SAC observation space to `Box(10,)` to include the macro flag.
+- Modified the reward function to heavily penalize the agent for opening or holding positions during `news_flag == 1`.
+
+**Results (Walk-Forward Out-of-Sample):**
+
+| Setup | Net Profit | Max Drawdown |
+|---|---|---|
+| Baseline SAC (no macro data) | +24.65% | 11.05% |
+| Experimental SAC (macro state integration) | -27.11% | 30.68% |
+
+**Conclusion:**
+
+Integrating macro data directly into the RL state space severely degraded performance. The agent developed what could be described as "scared agent syndrome" — closing highly profitable, long-running trend trades prematurely simply because a news event appeared on the horizon. This caused significant spread bleed from paying double broker fees to re-enter interrupted trends, and distorted the reward signal.
+
+DRL agents excel at continuous, flowing data like technical price action but struggle with sparse, binary anomalies like news drops. The signal is too rare and too irregular for the agent to learn a clean policy around it.
+
+**The conclusion is separation of concerns.** The SAC model is left completely blind to macro events, allowing it to optimize purely for technical price action. Risk management is decoupled and handled deterministically by `mt5bridge.py`, which halts trading via API polling during high volatility windows. The experimental training script is preserved in `xau_macro.py` for reference.
 
 ---
 
@@ -103,7 +132,7 @@ A **20% drawdown hard stop** terminates the episode early.
 [Walk-Forward Fine-Tuning]  ← loops week by week →
   • Collect experience (no gradients)
   • Maintain 4-week sliding replay buffer
-  • Fine-tune with N gradient steps
+  • Fine-tune with 1,000 gradient steps
   • Save model checkpoint per week
      │
      ▼
@@ -113,29 +142,6 @@ A **20% drawdown hard stop** terminates the episode early.
 ### Custom `WeeklyRollingBuffer`
 
 A custom replay buffer that tags every experience with an **ISO week label**. At each rollover, the oldest week's data is purged — ensuring the agent only learns from recent, relevant market regimes and preventing it from overfitting to stale market conditions.
-
----
-
-## News-Aware Training Architecture *(WIP)*
-
-The current training pipeline has a fundamental inconsistency: the live bot is forced flat during high impact news events, but the training environment has no awareness of those same events. This means the agent is learning patterns from news-driven candles — sharp, erratic price moves that it will never actually trade in production. It is training on data it is explicitly forbidden from acting on.
-
-The planned fix is a **news-aware training pipeline** that mirrors live behavior during simulation:
-
-```
-[Historical High Impact Events — 2023 to present]
-  Sourced from forex-news-scraper repo
-       │
-       ▼
-[Training Environment]
-  At each timestep, check if current candle falls within a high impact news window
-  If yes → force action = FLAT, skip experience collection
-  If no  → normal DRL step
-```
-
-By masking out news windows during training the same way the circuit breaker masks them in production, the agent will only ever learn from the candles it is actually allowed to trade. This removes the spurious patterns that news spikes inject into the training signal and should meaningfully improve the consistency of the learned policy.
-
-This also closes the train-test distribution gap that currently exists — right now the agent trains on a data distribution that includes news events, but is evaluated on one that excludes them.
 
 ---
 
@@ -164,13 +170,16 @@ All results are **out-of-sample** walk-forward backtests on XAUUSD M15 starting 
 
 ```
 drl-xauusd/
-├── xau.py              # Training pipeline (environment, WFO loop, backtest)
-├── mt5bridge.py        # Live execution bridge with macro circuit breaker
-├── converter.py        # Utility to convert raw CSV timestamps to UTC format
+├── xau.py                   # Training pipeline (environment, WFO loop, backtest)
+├── xau_macro.py             # Experimental macro state-space integration (see experiment above)
+├── mt5bridge.py             # Live execution bridge with macro circuit breaker
+├── converter.py             # Utility to convert raw CSV timestamps to UTC format
+├── merge_news.py            # Merges historical Hugging Face economic event data into OHLCV
 ├── data/
-│   └── data.csv        # Your M5 OHLCV CSV (not included)
+│   ├── data.csv             # Raw M5 OHLCV (not included)
+│   └── data_with_news.csv   # Merged dataset with news flags (not included)
 ├── models/
-│   └── *.zip           # Saved weekly model checkpoints (not included)
+│   └── *.zip                # Saved weekly model checkpoints (not included)
 └── README.md
 ```
 
@@ -181,16 +190,21 @@ drl-xauusd/
 ### Requirements
 
 ```bash
-pip install stable-baselines3 gymnasium pandas pandas-ta-classic MetaTrader5 torch requests tqdm
+pip install stable-baselines3 gymnasium pandas pandas-ta-classic MetaTrader5 torch requests tqdm datasets tensorboard
 ```
 
 ### 1. Prepare Data
 
-Your CSV should have the columns: `timestamp, open, high, low, close, volume`
+Ensure your base CSV has `timestamp, open, high, low, close, volume`. Then run:
 
-If timestamps are missing seconds/timezone:
 ```bash
 python converter.py your_data.csv
+```
+
+To reproduce the macro experiment, also run:
+
+```bash
+python merge_news.py
 ```
 
 ### 2. Train the Agent
@@ -244,4 +258,3 @@ The bridge waits for each M15 candle close, builds the observation vector from l
 - The reward function is simple; exploring reward shaping with Sharpe ratio or risk-adjusted PnL over longer windows is worth investigating
 - Generalization across different market regimes (trending vs. ranging) remains an open problem
 - The macro circuit breaker suppresses all new trades during high impact windows — a more refined approach could reduce position size rather than stop entirely
-- Training currently includes news-event candles that the live bot never trades — the news-aware training pipeline is intended to close this gap

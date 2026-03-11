@@ -57,3 +57,33 @@ Ending Balance:    $12,465.32
 Net Profit:        $2,465.32 (+24.65%)
 Max Drawdown:      11.05%
 ==================================================
+
+50k pre train and 1k gradient 256 batch macroanalyzer hard stop
+==================================================
+WALK-FORWARD OUT-OF-SAMPLE BACKTEST RESULTS
+==================================================
+Starting Balance:  $10,000.00
+Ending Balance:    $7,288.80
+Net Profit:        $-2,711.20 (-27.11%)
+Max Drawdown:      30.68%
+==================================================
+
+50k pre train and 1k gradient 256 batch macroanalyzer penalty
+==================================================
+WALK-FORWARD OUT-OF-SAMPLE BACKTEST RESULTS
+==================================================
+Starting Balance:  $10,000.00
+Ending Balance:    $9,745.16
+Net Profit:        $-254.84 (-2.55%)
+Max Drawdown:      17.04%
+==================================================
+
+50k pre train and 1k gradient 256 batch macroanalyzer asymetric penalty
+==================================================
+WALK-FORWARD OUT-OF-SAMPLE BACKTEST RESULTS
+==================================================
+Starting Balance:  $10,000.00
+Ending Balance:    $7,473.88
+Net Profit:        $-2,526.12 (-25.26%)
+Max Drawdown:      33.57%
+==================================================
