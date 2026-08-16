@@ -158,11 +158,57 @@ All results are **out-of-sample** walk-forward backtests on XAUUSD M15 starting 
 | 100k | 1,000 | 256 | $9,450.09 | -5.50% | 17.36% |
 | **50k** | **1,000** | **256** | **$12,465.32** | **+24.65%** | **11.05%** |
 
+> **Note:** This table reflects an earlier methodology where all 6 configs were compared
+> and reported on the same walk-forward window — a form of overfitting to that window.
+> See [Hyperparameter Validation Methodology](#hyperparameter-validation-methodology)
+> below for the corrected process; this table is pending a re-run under it.
+
 ### Key Observations
 - The model is **highly sensitive to gradient steps** — too few underfit, too many overfit aggressively to the current week and collapse on the next
 - **Batch size matters significantly** — 128 produced severe overfitting compared to 256
 - **More pretraining isn't always better** — 50k pretrain with 1k gradient steps outperformed 150k pretrain with the same fine-tuning config, suggesting that a lighter pretrain leaves the policy more adaptable during the walk-forward phase
 - The best config (+24.65%) is still not consistently profitable across all market regimes, indicating the agent hasn't solved the generalization problem — a known hard challenge in financial DRL
+
+---
+
+## Hyperparameter Validation Methodology
+
+The table above has a known methodology issue: all 6 configs were trained and
+backtested on the *same* walk-forward window, and the best-looking one was then reported
+as "the result." Once a config is chosen by comparing outcomes on a window, that window
+stops being a clean estimate of unseen performance for the winner — the selection
+process has already used it. DRL training is also seed-sensitive, and every run above
+used a single fixed seed, so a result could be an outlier rather than representative of
+that config's typical behavior.
+
+The corrected process:
+
+1. **Chronological split.** The data splits into three ordered blocks: pretraining
+   (first 26 weeks), a validation window, and a held-out test window at the end.
+   Walk-forward fine-tuning runs continuously through both — the split only changes
+   when results get looked at, not how training happens.
+2. **Rank on validation only.** Each candidate config is trained and walked forward
+   through the full timeline, but configs are compared using only the validation
+   segment's result.
+3. **Test the winner exactly once.** Only the winning config's held-out test-segment
+   result gets reported as the real out-of-sample number.
+4. **Multi-seed variance.** The winning config is rerun across several seeds, and a
+   mean ± standard deviation is reported instead of a single point estimate.
+
+This is implemented by four scripts:
+- `run_sweep.py` — trains and ranks several hyperparameter configs (steps 1–2 above),
+  running them concurrently as separate processes.
+- `run_seed_sweep.py` — reruns one chosen config across multiple seeds (step 4),
+  reusing a result already produced by `run_sweep.py` where possible instead of
+  re-running that seed.
+- `sweep_common.py` — the shared process-parallel execution engine both drivers above
+  use.
+- `smoke_test.py` — runs the same training pipeline against a small data slice with
+  tiny step counts, to catch pipeline bugs in seconds instead of after a multi-hour
+  real run.
+
+Results from this corrected process are pending a full re-run; the table above will be
+replaced once available.
 
 ---
 
@@ -173,8 +219,13 @@ drl-xauusd/
 ├── xau.py                   # Training pipeline (environment, WFO loop, backtest)
 ├── xau_macro.py             # Experimental macro state-space integration (see experiment above)
 ├── mt5bridge.py             # Live execution bridge with macro circuit breaker
+├── features.py               # Shared M5-to-M15 feature pipeline used by both xau.py and mt5bridge.py
 ├── converter.py             # Utility to convert raw CSV timestamps to UTC format
 ├── merge_news.py            # Merges historical Hugging Face economic event data into OHLCV
+├── smoke_test.py             # Fast pipeline sanity check on a small data slice
+├── run_sweep.py               # Hyperparameter sweep driver (see Validation Methodology)
+├── run_seed_sweep.py          # Seed-variance driver (see Validation Methodology)
+├── sweep_common.py            # Shared process-parallel execution engine for the two drivers above
 ├── data/
 │   ├── data.csv             # Raw M5 OHLCV (not included)
 │   └── data_with_news.csv   # Merged dataset with news flags (not included)

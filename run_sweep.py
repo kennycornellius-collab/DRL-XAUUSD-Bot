@@ -1,18 +1,22 @@
 """
-Phase 1 sweep driver for plan.md Problem 1 (OOS hyperparameter overfitting).
+Hyperparameter sweep driver: trains and walk-forward-backtests several
+xau.py::run_wfo_pipeline configs (pretrain steps / gradient steps / batch size) and
+ranks them using only a validation segment of the walk-forward window (see
+run_wfo_pipeline's val_weeks_count), so the held-out test segment for whichever config
+wins stays genuinely out-of-sample instead of having been used to pick the winner.
 
-Runs multiple xau.py::run_wfo_pipeline configs concurrently as separate OS processes
-(inter-run parallelism across independent runs) -- not intra-run environment
-parallelism, which would fight WeeklyRollingBuffer's single-env week-tracking and the
-cross-week balance/peak carry-over built for plan.md Problem 4.
+Runs the configs concurrently as separate OS processes (inter-run parallelism across
+independent runs) -- not intra-run environment parallelism, which would fight
+WeeklyRollingBuffer's single-env week-tracking and XAUEnv's sequential week-to-week
+balance/peak carry-over (each week's starting balance depends on the previous week's
+ending balance).
 
 Each config gets its own model_dir/tensorboard log name (no collisions) and its own
 log file under sweep_runs/<name>/log.txt (stdout/stderr redirected there so 4 parallel
 runs don't interleave in the terminal). Results are collected as JSON per run plus an
 aggregated sweep_runs/summary.json, and a ranking table is printed using ONLY the
 validation-segment metrics -- test-segment results are saved to disk but deliberately
-not printed here, so they aren't glanced at before a winner is chosen (see plan.md
-Problem 1's fix).
+not printed here, so they aren't glanced at before a winner is chosen.
 
 Usage:
     python run_sweep.py                      # real Phase 1 sweep, 4 parallel workers

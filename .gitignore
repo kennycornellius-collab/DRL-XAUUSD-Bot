@@ -9,3 +9,7 @@ venv/
 data/
 
 __pycache__
+
+sweep_runs/
+
+sweep_runs_seeds/
