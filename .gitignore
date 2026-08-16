@@ -7,3 +7,5 @@ tensorboard_logs/
 venv/
 
 data/
+
+__pycache__
