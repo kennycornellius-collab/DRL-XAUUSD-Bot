@@ -234,50 +234,98 @@ class WeekRolloverCallback(BaseCallback):
         return True
 
 
-def run_wfo_pipeline(csv_path: str):
-    os.makedirs("./models", exist_ok=True)
+def compute_backtest_metrics(equity_curve: List[float]) -> Dict[str, float]:
+    eq_arr = np.array(equity_curve)
+    start_bal = eq_arr[0]
+    end_bal = eq_arr[-1]
+    net_profit = end_bal - start_bal
+    ret_pct = (net_profit / start_bal) * 100 if start_bal else 0.0
+
+    peaks = np.maximum.accumulate(eq_arr)
+    drawdowns = (peaks - eq_arr) / peaks
+    max_dd = np.max(drawdowns) * 100 if len(eq_arr) > 1 else 0.0
+
+    return {
+        "start_balance": float(start_bal),
+        "end_balance": float(end_bal),
+        "net_profit": float(net_profit),
+        "net_profit_pct": float(ret_pct),
+        "max_drawdown_pct": float(max_dd),
+    }
+
+
+def print_backtest_summary(title: str, metrics: Dict[str, float]) -> None:
+    print("\n" + "="*50)
+    print(title)
+    print("="*50)
+    print(f"Starting Balance:  ${metrics['start_balance']:,.2f}")
+    print(f"Ending Balance:    ${metrics['end_balance']:,.2f}")
+    print(f"Net Profit:        ${metrics['net_profit']:,.2f} ({metrics['net_profit_pct']:+.2f}%)")
+    print(f"Max Drawdown:      {metrics['max_drawdown_pct']:.2f}%")
+    print("="*50 + "\n")
+
+
+def run_wfo_pipeline(
+    csv_path: str,
+    pretrain_weeks_count: int = 26,
+    val_weeks_count: int = 79,
+    pretrain_timesteps: int = 50_000,
+    gradient_steps: int = 1000,
+    batch_size: int = 256,
+    buffer_size: int = 1920,
+    replay_window_weeks: int = 4,
+    min_week_rows: int = 50,
+    seed: int = 42,
+    model_dir: str = "./models",
+    tb_log_name: str = "SAC_Pretrain",
+    num_torch_threads: Optional[int] = None,
+) -> Dict[str, Any]:
+    if num_torch_threads is not None:
+        torch.set_num_threads(num_torch_threads)
+
+    os.makedirs(model_dir, exist_ok=True)
     df = prepare_data(csv_path)
 
     weeks = sorted(df['week_label'].unique())
-    if len(weeks) < 27:
-        raise ValueError(f"Not enough data. Needed >26 weeks, got {len(weeks)}.")
+    if len(weeks) < pretrain_weeks_count + 1:
+        raise ValueError(f"Not enough data. Needed >{pretrain_weeks_count} weeks, got {len(weeks)}.")
 
-    pretrain_weeks = weeks[:26]
-    walk_forward_weeks = weeks[26:]
+    pretrain_weeks = weeks[:pretrain_weeks_count]
+    walk_forward_weeks = weeks[pretrain_weeks_count:]
+    validation_weeks = set(walk_forward_weeks[:val_weeks_count])
+    test_weeks = set(walk_forward_weeks[val_weeks_count:])
 
     print(f"Pretraining on {len(pretrain_weeks)} weeks: {pretrain_weeks[0]} to {pretrain_weeks[-1]}")
     pretrain_df = df[df['week_label'].isin(pretrain_weeks)].copy()
 
     pretrain_env = DummyVecEnv([lambda: XAUEnv(pretrain_df)])
-    
 
-    MAX_BUFFER_SIZE = 1920
-    
     model = SAC(
-        "MlpPolicy", 
-        pretrain_env, 
+        "MlpPolicy",
+        pretrain_env,
         policy_kwargs=dict(net_arch=[128, 128]),
         replay_buffer_class=WeeklyRollingBuffer,
-        buffer_size=MAX_BUFFER_SIZE,
-        seed=42,
-        verbose=1, 
+        buffer_size=buffer_size,
+        seed=seed,
+        verbose=1,
         tensorboard_log="./tensorboard_logs/"
     )
 
     cb = WeekRolloverCallback(verbose=1)
     start_time = time.time()
 
-    model.learn(total_timesteps=50_000, callback=cb, tb_log_name="SAC_Pretrain")
+    model.learn(total_timesteps=pretrain_timesteps, callback=cb, tb_log_name=tb_log_name)
     print(f"Pre-training complete. Wall time: {time.time() - start_time:.2f}s")
-    model.save("./models/sac_xauusd_pretrained.zip")
+    model.save(os.path.join(model_dir, "sac_xauusd_pretrained.zip"))
 
     oos_equity_curve = [10000.0]
+    equity_curve_weeks: List[str] = []
     running_peak_balance = 10000.0
 
     for step_idx, w in enumerate(tqdm(walk_forward_weeks, desc="WFO Progress", unit="week")):
         w_df = df[df['week_label'] == w].copy()
 
-        if len(w_df) < 50:
+        if len(w_df) < min_week_rows:
             continue
 
         # Carry balance/peak forward instead of resetting to $10k each week, so the
@@ -303,44 +351,59 @@ def run_wfo_pipeline(csv_path: str):
 
         new_balance = oos_equity_curve[-1] + ep_pnl
         oos_equity_curve.append(new_balance)
+        equity_curve_weeks.append(w)
         running_peak_balance = infos[0]['peak_balance']
 
-        if len(model.replay_buffer.week_index_map) > 4:
+        if len(model.replay_buffer.week_index_map) > replay_window_weeks:
             model.replay_buffer.purge_oldest_week()
 
-        model.train(gradient_steps=1000, batch_size=256)
-        
+        model.train(gradient_steps=gradient_steps, batch_size=batch_size)
+
         occupancy = model.replay_buffer.valid_mask.sum()
 
         model.logger.record("wfo/episode_reward", ep_reward)
         model.logger.record("wfo/episode_pnl", ep_pnl)
         model.logger.record("wfo/buffer_occupancy", occupancy)
-        model.logger.dump(step=step_idx) 
+        model.logger.dump(step=step_idx)
 
-        model.save(f"./models/sac_xauusd_week_{w}.zip")
-        
+        model.save(os.path.join(model_dir, f"sac_xauusd_week_{w}.zip"))
+
         elapsed = time.time() - loop_start
-        tqdm.write(f"| WFO Complete: {w} | Reward: {ep_reward:7.2f} | PnL: ${ep_pnl:7.2f} | Buffer Occ: {occupancy}/{MAX_BUFFER_SIZE} | Time: {elapsed:5.2f}s |")
+        tqdm.write(f"| WFO Complete: {w} | Reward: {ep_reward:7.2f} | PnL: ${ep_pnl:7.2f} | Buffer Occ: {occupancy}/{buffer_size} | Time: {elapsed:5.2f}s |")
 
+    full_metrics = compute_backtest_metrics(oos_equity_curve)
+    print_backtest_summary("WALK-FORWARD OUT-OF-SAMPLE BACKTEST RESULTS (FULL)", full_metrics)
 
-    print("\n" + "="*50)
-    print("WALK-FORWARD OUT-OF-SAMPLE BACKTEST RESULTS")
-    print("="*50)
-    start_bal = oos_equity_curve[0]
-    end_bal = oos_equity_curve[-1]
-    net_profit = end_bal - start_bal
-    ret_pct = (net_profit / start_bal) * 100
-    
-    eq_arr = np.array(oos_equity_curve)
-    peaks = np.maximum.accumulate(eq_arr)
-    drawdowns = (peaks - eq_arr) / peaks
-    max_dd = np.max(drawdowns) * 100
+    # Split the equity curve at the validation/test boundary using the weeks that were
+    # actually processed (some weeks may have been skipped via min_week_rows), so config
+    # selection can be based on the validation segment alone without touching test.
+    val_curve = [oos_equity_curve[0]]
+    test_curve: Optional[List[float]] = None
+    for w, bal in zip(equity_curve_weeks, oos_equity_curve[1:]):
+        if w in validation_weeks:
+            val_curve.append(bal)
+        elif w in test_weeks:
+            if test_curve is None:
+                test_curve = [val_curve[-1]]
+            test_curve.append(bal)
 
-    print(f"Starting Balance:  ${start_bal:,.2f}")
-    print(f"Ending Balance:    ${end_bal:,.2f}")
-    print(f"Net Profit:        ${net_profit:,.2f} ({ret_pct:+.2f}%)")
-    print(f"Max Drawdown:      {max_dd:.2f}%")
-    print("="*50 + "\n")
+    results: Dict[str, Any] = {
+        "oos_equity_curve": oos_equity_curve,
+        "equity_curve_weeks": equity_curve_weeks,
+        "full": full_metrics,
+    }
+
+    if len(val_curve) > 1:
+        val_metrics = compute_backtest_metrics(val_curve)
+        print_backtest_summary("VALIDATION SEGMENT RESULTS", val_metrics)
+        results["validation"] = val_metrics
+
+    if test_curve and len(test_curve) > 1:
+        test_metrics = compute_backtest_metrics(test_curve)
+        print_backtest_summary("TEST SEGMENT RESULTS (only inspect once, for the already-chosen winner)", test_metrics)
+        results["test"] = test_metrics
+
+    return results
 
 def generate_dummy_csv(path="dummy_xauusd.csv"):
     if not os.path.exists(path):
