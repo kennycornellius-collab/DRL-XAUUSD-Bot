@@ -25,7 +25,11 @@ def prepare_data(csv_path: str) -> pd.DataFrame:
     df_m5['timestamp'] = pd.to_datetime(df_m5['timestamp'], utc=True)
 
     df_m15 = compute_m15_features(df_m5)
-    df_m15['week_label'] = df_m15['timestamp'].dt.strftime("%Y-W%V")
+    # %G (ISO week-based year), not %Y (Gregorian year) - %Y-W%V mislabels the last
+    # few days of December as week 1 of the *current* year when they're actually ISO
+    # week 1 of the *next* year, colliding with the real week 1 in January and silently
+    # splicing two dates ~1 year apart into a single "week".
+    df_m15['week_label'] = df_m15['timestamp'].dt.strftime("%G-W%V")
 
     print(f"Data prepped. M15 Shape: {df_m15.shape}")
     return df_m15
