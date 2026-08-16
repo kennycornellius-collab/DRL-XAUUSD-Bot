@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta_classic as ta
 from tqdm import tqdm
 
 import gymnasium as gym
@@ -17,49 +16,17 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
+from features import compute_m15_features
+
 
 def prepare_data(csv_path: str) -> pd.DataFrame:
     print(f"Loading data from {csv_path}...")
     df_m5 = pd.read_csv(csv_path)
     df_m5['timestamp'] = pd.to_datetime(df_m5['timestamp'], utc=True)
-    df_m5.sort_values('timestamp', ascending=True, inplace=True)
-    df_m5.reset_index(drop=True, inplace=True)
 
-    adx_df = df_m5.ta.adx(length=14)
-    if adx_df is not None and 'ADX_14' in adx_df.columns:
-         df_m5['adx'] = adx_df['ADX_14']
-    else:
-         
-         df_m5['adx'] = np.nan
-
-    
-    df_m5.set_index('timestamp', inplace=True)
-    
-    
-    agg_dict = {
-        'open': 'first',
-        'high': 'max',
-        'low': 'min',
-        'close': 'last',
-        'volume': 'sum'
-    }
-    
-    df_m15 = df_m5.resample('15min', closed='left', label='left').agg(agg_dict)
-    df_m15.reset_index(inplace=True)
-
-    df_m5_adx = df_m5[['adx']].dropna().reset_index()
-    df_m15 = pd.merge_asof(
-        df_m15.sort_values('timestamp'), 
-        df_m5_adx.sort_values('timestamp'), 
-        on='timestamp', 
-        direction='backward'
-    )
-
-    df_m15.dropna(inplace=True)
-    df_m15.reset_index(drop=True, inplace=True)
-   
+    df_m15 = compute_m15_features(df_m5)
     df_m15['week_label'] = df_m15['timestamp'].dt.strftime("%Y-W%V")
-    
+
     print(f"Data prepped. M15 Shape: {df_m15.shape}")
     return df_m15
 

@@ -5,10 +5,11 @@ import requests
 import datetime
 import numpy as np
 import pandas as pd
-import pandas_ta_classic as ta
 import MetaTrader5 as mt5
 
 from stable_baselines3 import SAC
+
+from features import compute_m15_features
 
 SYMBOL = "XAUUSDm"
 TIMEFRAME = mt5.TIMEFRAME_M15 
@@ -58,24 +59,22 @@ def fetch_macro_regime():
 
 def get_drl_observation():
     global PEAK_BALANCE
-    
-    rates = mt5.copy_rates_from_pos(SYMBOL, TIMEFRAME, 0, 250)
+
+    # Pulled at M5 and resampled here (via compute_m15_features) rather than
+    # fetched directly at M15, so the live ADX matches training's
+    # M5-then-merge pipeline instead of a different M15-native calculation.
+    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 1000)
     if rates is None:
         print("Failed to get MT5 rates.")
         return None
-        
-    df = pd.DataFrame(rates)
-    df.rename(columns={'tick_volume': 'volume'}, inplace=True)
-    
-    adx_df = df.ta.adx(length=14)
-    if adx_df is not None and 'ADX_14' in adx_df.columns:
-         df['adx'] = adx_df['ADX_14']
-    else:
-         df['adx'] = np.nan
-         
-    df.dropna(inplace=True)
-    
-    hist_df = df[['open', 'high', 'low', 'close', 'volume', 'adx']].tail(200)
+
+    df_m5 = pd.DataFrame(rates)
+    df_m5.rename(columns={'tick_volume': 'volume'}, inplace=True)
+    df_m5['timestamp'] = pd.to_datetime(df_m5['time'], unit='s', utc=True)
+
+    df_m15 = compute_m15_features(df_m5)
+
+    hist_df = df_m15[['open', 'high', 'low', 'close', 'volume', 'adx']].tail(200)
     if len(hist_df) < 200:
         print("Not enough clean data. Waiting")
         return None

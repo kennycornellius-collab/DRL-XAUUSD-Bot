@@ -29,7 +29,7 @@ if __name__ == "__main__":
         input_file = sys.argv[1]
         output_file = input_file.replace(".csv", "_converted.csv")
     else:
-        print("Usage: python convert_timestamps.py input.csv [output.csv]")
+        print("Usage: python converter.py input.csv")
         sys.exit(1)
 
     convert_timestamps(input_file, output_file)
