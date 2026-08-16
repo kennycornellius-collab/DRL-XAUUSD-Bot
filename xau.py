@@ -31,10 +31,12 @@ def prepare_data(csv_path: str) -> pd.DataFrame:
     return df_m15
 
 class XAUEnv(gym.Env):
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, df: pd.DataFrame, initial_balance: float = 10000.0, initial_peak_balance: Optional[float] = None):
         super().__init__()
         self.df = df.reset_index(drop=True)
         self.max_steps = len(self.df) - 1
+        self.initial_balance = initial_balance
+        self.initial_peak_balance = initial_peak_balance if initial_peak_balance is not None else initial_balance
 
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(9,), dtype=np.float32)
 
@@ -56,8 +58,8 @@ class XAUEnv(gym.Env):
         
         self.position = 0
         self.entry_price = 0.0
-        self.balance = 10000.0  
-        self.peak_balance = 10000.0
+        self.balance = self.initial_balance
+        self.peak_balance = self.initial_peak_balance
         self.current_unrealized_pnl = 0.0
         self.current_dd = 0.0
 
@@ -138,7 +140,8 @@ class XAUEnv(gym.Env):
         info = {
             "week_label": self.current_week_label() if not done else self.df.iloc[-1]['week_label'],
             "step_pnl": step_return,
-            "balance": self.balance
+            "balance": self.balance,
+            "peak_balance": self.peak_balance
         }
         return self._get_obs(), float(reward), done, truncated, info
 
@@ -269,17 +272,21 @@ def run_wfo_pipeline(csv_path: str):
     model.save("./models/sac_xauusd_pretrained.zip")
 
     oos_equity_curve = [10000.0]
+    running_peak_balance = 10000.0
 
     for step_idx, w in enumerate(tqdm(walk_forward_weeks, desc="WFO Progress", unit="week")):
         w_df = df[df['week_label'] == w].copy()
 
-        if len(w_df) < 50: 
+        if len(w_df) < 50:
             continue
-            
-        wf_env = DummyVecEnv([lambda: XAUEnv(w_df)])
+
+        # Carry balance/peak forward instead of resetting to $10k each week, so the
+        # env's own drawdown penalty and 20% hard stop react to true cumulative
+        # equity (matching mt5bridge.py's PEAK_BALANCE) instead of each week in isolation.
+        wf_env = DummyVecEnv([lambda: XAUEnv(w_df, initial_balance=oos_equity_curve[-1], initial_peak_balance=running_peak_balance)])
         obs = wf_env.reset()
         done = False
-        
+
         ep_reward = 0.0
         ep_pnl = 0.0
         loop_start = time.time()
@@ -288,7 +295,7 @@ def run_wfo_pipeline(csv_path: str):
             action, _ = model.predict(obs, deterministic=True)
             next_obs, rewards, dones, infos = wf_env.step(action)
             model.replay_buffer.add(obs, next_obs, action, rewards, dones, infos)
-            
+
             ep_reward += rewards[0]
             ep_pnl += infos[0]['step_pnl']
             obs = next_obs
@@ -296,6 +303,7 @@ def run_wfo_pipeline(csv_path: str):
 
         new_balance = oos_equity_curve[-1] + ep_pnl
         oos_equity_curve.append(new_balance)
+        running_peak_balance = infos[0]['peak_balance']
 
         if len(model.replay_buffer.week_index_map) > 4:
             model.replay_buffer.purge_oldest_week()
