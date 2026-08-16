@@ -14,7 +14,7 @@ The agent trades Gold (XAUUSD) on the M15 timeframe using Soft Actor-Critic (SAC
 
 Reward shaping uses a Sortino-like ratio with an explicit drawdown penalty, and a 20% drawdown hard stop terminates episodes early — building capital preservation directly into the training objective rather than treating it as an afterthought.
 
-Hyperparameter experiments revealed the model is highly sensitive to the number of gradient steps per fine-tuning cycle. Too few and the agent underfits; too many and it overfits aggressively to the current week and collapses on the next. The best configuration achieved +24.65% net profit over the out-of-sample walk-forward period with an 11% max drawdown — though generalizing consistently across different market regimes remains an open problem.
+A hyperparameter sweep compared pretrain steps, gradient steps, and batch size across 6 configs. The model is clearly sensitive to gradient steps — 1,000 gradient steps per fine-tuning cycle beats both fewer (500) and more (2,000) by a wide margin — but the winning configuration's headline profit number didn't hold up once rerun across 5 random seeds under a proper validation/test split (see [Hyperparameter Validation Methodology](#hyperparameter-validation-methodology)): net profit's standard deviation across seeds is far larger than its mean, in both the validation and held-out test segments. In plain terms, **the agent is not reliably profitable under this setup** — any single training run's headline number is dominated by seed luck rather than a consistently learned trading edge. That finding is documented in full below rather than smoothed over, since it's the most important result this project's methodology work has produced.
 
 ---
 
@@ -65,6 +65,11 @@ The check runs on every M15 candle close, not just at startup. If the macro regi
 |---|---|---|
 | Baseline SAC (no macro data) | +24.65% | 11.05% |
 | Experimental SAC (macro state integration) | -27.11% | 30.68% |
+
+> Both rows use the same single-window, single-seed methodology later found unreliable
+> (see [Hyperparameter Experiment Results](#hyperparameter-experiment-results)). The
+> relative conclusion below (macro integration made things worse) is likely still valid,
+> but neither absolute number should be read as a robust estimate of real performance.
 
 **Conclusion:**
 
@@ -147,7 +152,67 @@ A custom replay buffer that tags every experience with an **ISO week label**. At
 
 ## Hyperparameter Experiment Results
 
-All results are **out-of-sample** walk-forward backtests on XAUUSD M15 starting from $10,000.
+### Corrected Results (validation/test split + 5-seed variance)
+
+Six candidate configs were trained and walk-forward-backtested, then ranked using only
+a validation segment of the walk-forward window (see
+[Hyperparameter Validation Methodology](#hyperparameter-validation-methodology) below):
+
+| Pretrain Steps | Gradient Steps | Batch Size | Validation Net Profit | Validation Max DD |
+|---|---|---|---|---|
+| **150k** | **1,000** | **256** | **+8.18%** | **3.33%** |
+| 100k | 1,000 | 256 | +5.78% | 2.29% |
+| 50k | 1,000 | 256 | +3.77% | 3.75% |
+| 150k | 1,000 | 128 | +3.42% | 2.72% |
+| 150k | 2,000 | 256 | -19.80% | 19.86% |
+| 150k | 500 | 256 | -19.95% | 19.95% |
+
+`150k / 1,000 / 256` won on net profit (though not on drawdown — `100k / 1,000 / 256`
+had the lowest, 2.29% — a real tradeoff, unlike an earlier version of this sweep that
+had a data bug making one config dominate on both axes; see the note below). Its
+held-out test-segment result: **+9.48% net profit, 5.64% max drawdown** — actually
+*better* than its own validation result, a good sign against overfitting to the
+validation window. That looked like a genuinely good, robust result — until it was
+rerun across 5 random seeds:
+
+| Seed | Validation Net % | Validation Max DD % | Test Net % | Test Max DD % |
+|---|---|---|---|---|
+| 42 | +8.18 | 3.33 | +9.48 | 5.64 |
+| 44 | -6.74 | 14.03 | -4.18 | 12.44 |
+| 46 | -10.55 | 11.33 | -10.60 | 13.68 |
+| 45 | -15.69 | 15.72 | +8.99 | 7.42 |
+| 43 | -19.94 | 19.94 | -0.16 | 0.16 |
+
+**Mean ± std across seeds: validation -8.95% ± 9.66%, test +0.71% ± 7.72%.**
+
+**Conclusion: this configuration — and, by extension, the current reward/observation
+setup at this training scale — is not reliably profitable.** 4 of 5 seeds show a losing
+validation result; only seed 42 (the one used for every other result in this project's
+history) came out ahead. The test segment's mean is barely positive but its standard
+deviation is an order of magnitude larger than the mean itself. Any single training
+run's headline number is dominated by seed luck rather than a consistently learned
+trading edge.
+
+> **A genuine data bug was found and fixed during this investigation.**
+> `xau.py`'s week-labeling used `%Y-W%V` (Gregorian year + ISO week number), which
+> silently mislabels the last few days of December as week 1 of the *current* year when
+> they're actually ISO week 1 of the *next* year — colliding with the real January week
+> 1 under the identical label. Two week-labels in this dataset (`2024-W01`, `2025-W01`)
+> each secretly spliced together dates roughly a year apart into what the walk-forward
+> loop treated as one contiguous week, producing a fake single-step price jump (gold's
+> real year-over-year move, ~$1,694 in one case) that dominated whichever seed's policy
+> happened to be positioned on either side of it. Fixed by using `%G-W%V` instead
+> (`%G` = ISO week-based year). The table and seed results above are from the corrected
+> code; an earlier version of this investigation (before the fix) showed even larger,
+> partly-artifactual variance across seeds and configs — this is the trustworthy version.
+
+### Original Results (superseded)
+
+The table below was this project's initial result, before the validation/test split,
+multi-seed steps, and week-label fix above existed. It's kept for reference, but has
+multiple known issues — see
+[Hyperparameter Validation Methodology](#hyperparameter-validation-methodology) and the
+data-bug note above.
 
 | Pretrain Steps | Gradient Steps | Batch Size | End Balance | Net Profit | Max Drawdown |
 |---|---|---|---|---|---|
@@ -156,30 +221,23 @@ All results are **out-of-sample** walk-forward backtests on XAUUSD M15 starting 
 | 150k | 2,000 | 256 | $5,299.15 | -47.01% | 49.82% |
 | 150k | 1,000 | 128 | $4,706.40 | -52.94% | 55.49% |
 | 100k | 1,000 | 256 | $9,450.09 | -5.50% | 17.36% |
-| **50k** | **1,000** | **256** | **$12,465.32** | **+24.65%** | **11.05%** |
+| 50k | 1,000 | 256 | $12,465.32 | +24.65% | 11.05% |
 
-> **Note:** This table reflects an earlier methodology where all 6 configs were compared
-> and reported on the same walk-forward window — a form of overfitting to that window.
-> See [Hyperparameter Validation Methodology](#hyperparameter-validation-methodology)
-> below for the corrected process; this table is pending a re-run under it.
-
-### Key Observations
-- The model is **highly sensitive to gradient steps** — too few underfit, too many overfit aggressively to the current week and collapse on the next
-- **Batch size matters significantly** — 128 produced severe overfitting compared to 256
-- **More pretraining isn't always better** — 50k pretrain with 1k gradient steps outperformed 150k pretrain with the same fine-tuning config, suggesting that a lighter pretrain leaves the policy more adaptable during the walk-forward phase
-- The best config (+24.65%) is still not consistently profitable across all market regimes, indicating the agent hasn't solved the generalization problem — a known hard challenge in financial DRL
+#### Key Observations (from the original, single-seed, bug-contaminated sweep — superseded by the results above)
+- The model appeared highly sensitive to gradient steps in this original sweep, and this one held up: in the corrected sweep, all 4 positive configs use exactly 1,000 gradient steps, while both 500 and 2,000 land at the bottom — 1,000 looks like a genuine sweet spot, not a single-seed fluke
+- Batch size 128 looked catastrophic here (-52.94%), but the corrected sweep shows it competitively (+3.42%, 4th of 6) — this observation did *not* hold up, and was likely a week-label-bug artifact
 
 ---
 
 ## Hyperparameter Validation Methodology
 
-The table above has a known methodology issue: all 6 configs were trained and
-backtested on the *same* walk-forward window, and the best-looking one was then reported
-as "the result." Once a config is chosen by comparing outcomes on a window, that window
-stops being a clean estimate of unseen performance for the winner — the selection
-process has already used it. DRL training is also seed-sensitive, and every run above
-used a single fixed seed, so a result could be an outlier rather than representative of
-that config's typical behavior.
+The "Original Results" table above has a known methodology issue: all 6 configs were
+trained and backtested on the *same* walk-forward window, and the best-looking one was
+then reported as "the result." Once a config is chosen by comparing outcomes on a
+window, that window stops being a clean estimate of unseen performance for the winner —
+the selection process has already used it. DRL training is also seed-sensitive, and
+every run in that table used a single fixed seed, so a result could be an outlier rather
+than representative of that config's typical behavior.
 
 The corrected process:
 
@@ -207,8 +265,7 @@ This is implemented by four scripts:
   tiny step counts, to catch pipeline bugs in seconds instead of after a multi-hour
   real run.
 
-Results from this corrected process are pending a full re-run; the table above will be
-replaced once available.
+Results from this corrected process are in the Corrected Results section above.
 
 ---
 
@@ -304,6 +361,12 @@ The bridge waits for each M15 candle close, builds the observation vector from l
 
 ## Limitations & Future Work
 
+- **The agent is not reliably profitable.** A 5-seed rerun of the best validated
+  hyperparameter config showed net profit's standard deviation far exceeds its mean in
+  both the validation and held-out test segments (see
+  [Hyperparameter Experiment Results](#hyperparameter-experiment-results)) — any single
+  run's result is dominated by seed luck. This is the most important open problem;
+  everything below is secondary to it
 - The agent uses only 6 market features — adding more indicators (RSI, Bollinger Bands, session filters) may improve signal quality
 - No position sizing — fixed 0.01 lots; Kelly Criterion or volatility-based sizing could improve risk-adjusted returns
 - The reward function is simple; exploring reward shaping with Sharpe ratio or risk-adjusted PnL over longer windows is worth investigating
