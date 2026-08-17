@@ -60,7 +60,7 @@ class XAUEnv(gym.Env):
         super().reset(seed=seed)
         self.current_step = self.start_index
         
-        self.position = 0
+        self.position = 0.0
         self.entry_price = 0.0
         self.balance = self.initial_balance
         self.peak_balance = self.initial_peak_balance
@@ -82,19 +82,28 @@ class XAUEnv(gym.Env):
         self.history_200.append(feats)
 
     def step(self, action: np.ndarray):
-        act_val = action[0]
+        act_val = float(np.clip(action[0], -1.0, 1.0))
         position_before = self.position
+        dir_before = np.sign(position_before)
 
-        if act_val < -0.3:
-            new_pos = -1
-        elif act_val > 0.3:
-            new_pos = 1
+        # Beyond the +-0.3 deadzone, position size tracks the raw action value instead of
+        # snapping to +-1 - a barely-confident 0.31 and a maximally-confident 0.99 now get
+        # proportionally different exposure. At |action|==1.0 this reproduces the old
+        # always-full-size behavior exactly.
+        if act_val < -0.3 or act_val > 0.3:
+            new_pos = act_val
         else:
-            new_pos = 0
+            new_pos = 0.0
+        dir_after = np.sign(new_pos)
 
+        # Cost is only charged on the same "events" as before (opening from flat, or
+        # reversing direction) - resizing within the same direction and closing to flat
+        # both stay free, matching the original model. Now proportional to the size of the
+        # position being entered rather than a flat fee, so it still charges exactly $0.30
+        # at full size but less for a partial-conviction entry.
         spread_cost = 0.0
-        if new_pos != 0 and new_pos != self.position:
-            spread_cost = 0.30
+        if dir_after != 0 and dir_after != dir_before:
+            spread_cost = 0.30 * abs(new_pos)
 
         current_close = self.df.iloc[self.current_step]['close']
 
@@ -127,9 +136,13 @@ class XAUEnv(gym.Env):
             reward -= 0.5 * self.current_dd
 
         self.position = new_pos
-        
-        if self.position != 0:
-            if self.entry_price == 0.0:
+
+        if dir_after != 0:
+            # Reset the entry reference on a fresh entry *or* a direct reversal (dir
+            # changes without passing through exactly 0) - previously only the "was 0.0"
+            # check ran, so a reversal kept the old (now-closed) trade's entry price and
+            # computed unrealized PnL against the wrong reference.
+            if dir_after != dir_before:
                 self.entry_price = current_close
             self.current_unrealized_pnl = self.position * (next_close - self.entry_price)
         else:
@@ -472,20 +485,25 @@ def run_wfo_pipeline(
             ep_pnl += infos[0]['step_pnl']
 
             # Attribute this bar's price move to whichever trade was open going into it,
-            # and open/close trades on position changes (flat<->position or a direct
-            # reversal), so trade PnL/duration reflect the env's own position bookkeeping
-            # rather than a separate reimplementation of it.
+            # and open/close trades on *direction* changes (flat<->position or a direct
+            # reversal) rather than exact position equality - with continuous sizing the
+            # raw position value changes almost every step even while direction is held,
+            # so grouping by sign is what keeps "a trade" meaning a directional hold
+            # instead of fragmenting into one degenerate trade per step. Mirrors the
+            # dir_before/dir_after boundary XAUEnv.step() itself uses for entry costs.
             pos_before = infos[0]['position_before']
             pos_after = infos[0]['position_after']
-            if pos_before != 0 and current_trade is not None:
+            dir_before = np.sign(pos_before)
+            dir_after = np.sign(pos_after)
+            if dir_before != 0 and current_trade is not None:
                 current_trade['pnl'] += infos[0]['price_pnl']
                 current_trade['duration'] += 1
-            if pos_after != pos_before:
+            if dir_after != dir_before:
                 if current_trade is not None:
                     trades.append(current_trade)
                     current_trade = None
-                if pos_after != 0:
-                    current_trade = {"week": w, "direction": pos_after, "pnl": -infos[0]['spread_cost'], "duration": 0}
+                if dir_after != 0:
+                    current_trade = {"week": w, "direction": int(dir_after), "pnl": -infos[0]['spread_cost'], "duration": 0}
 
             obs = next_obs
             done = dones[0]
