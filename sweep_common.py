@@ -22,12 +22,25 @@ from typing import Any, Dict, List, Optional
 from xau import run_wfo_pipeline
 
 
+def write_thread_alloc(thread_alloc_path: str, active: int, logical_cores: int) -> None:
+    """Atomically (write-temp-then-replace) update the shared status file each worker's
+    ThreadAllocPoller (xau.py) watches, so runs still going can absorb logical cores freed
+    up by ones that already finished. Same helper as run_sweep.py's copy - not yet
+    de-duplicated, per this module's existing NOTE above."""
+    alloc = {"active": active, "threads_per_worker": max(1, logical_cores // max(1, active))}
+    tmp_path = thread_alloc_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(alloc, f)
+    os.replace(tmp_path, thread_alloc_path)
+
+
 def run_one(
     run_spec: Dict[str, Any],
     csv_path: str,
     sweep_dir: str,
     num_torch_threads: Optional[int],
     extra_kwargs: Dict[str, Any],
+    thread_alloc_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     name = run_spec["name"]
     run_dir = os.path.join(sweep_dir, name)
@@ -47,6 +60,7 @@ def run_one(
                 model_dir=model_dir,
                 tb_log_name=f"SAC_Pretrain_{name}",
                 num_torch_threads=num_torch_threads,
+                thread_alloc_path=thread_alloc_path,
                 **extra_kwargs,
             )
             results["config"] = run_spec
@@ -76,13 +90,18 @@ def run_parallel(
     logical_cores = os.cpu_count() or max_parallel
     num_torch_threads = max(1, logical_cores // max_parallel)
 
+    active_count = len(run_specs)
+    thread_alloc_path = os.path.join(sweep_dir, "_thread_alloc.json")
+    write_thread_alloc(thread_alloc_path, active_count, logical_cores)
+
     print(f"Launching {len(run_specs)} run(s), max {max_parallel} in parallel, "
-          f"{num_torch_threads} torch thread(s) per worker...")
+          f"{num_torch_threads} torch thread(s) per worker (dynamically reallocated as "
+          f"runs finish)...")
 
     results_by_name: Dict[str, Dict[str, Any]] = {}
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_parallel) as executor:
         futures = {
-            executor.submit(run_one, spec, csv_path, sweep_dir, num_torch_threads, extra_kwargs): spec["name"]
+            executor.submit(run_one, spec, csv_path, sweep_dir, num_torch_threads, extra_kwargs, thread_alloc_path): spec["name"]
             for spec in run_specs
         }
         for future in concurrent.futures.as_completed(futures):
@@ -99,6 +118,9 @@ def run_parallel(
                 print(f"[CRASH] {name}: {e}")
                 result = {"config": {"name": name}, "status": "crash", "error": str(e)}
             results_by_name[name] = result
+
+            active_count -= 1
+            write_thread_alloc(thread_alloc_path, active_count, logical_cores)
 
     with open(os.path.join(sweep_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(results_by_name, f, indent=2, default=str)

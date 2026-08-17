@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import threading
 import collections
 from typing import Any, Dict, List, Optional
 
@@ -250,6 +252,48 @@ class WeeklyRollingBuffer(ReplayBuffer):
         return self._get_samples(batch_inds, env=env)
 
 
+class ThreadAllocPoller:
+    """Background daemon thread that watches a shared JSON status file (written by the
+    sweep driver's parent process) and re-calls torch.set_num_threads() whenever the
+    recommended thread count for this worker changes - lets a straggler config absorb
+    logical cores freed up by sibling configs finishing early, instead of being stuck
+    with whatever thread count was decided when the sweep was first launched. Runs
+    independently of the main thread's own work (pretraining vs. the walk-forward loop),
+    so one mechanism covers both phases without needing separate polling hooks in each.
+    A no-op entirely if thread_alloc_path is None (the single, non-sweep run case)."""
+
+    def __init__(self, thread_alloc_path: Optional[str], poll_interval: float = 3.0):
+        self.thread_alloc_path = thread_alloc_path
+        self.poll_interval = poll_interval
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if not self.thread_alloc_path:
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                with open(self.thread_alloc_path, "r", encoding="utf-8") as f:
+                    alloc = json.load(f)
+                target = int(alloc["threads_per_worker"])
+                if target != torch.get_num_threads():
+                    torch.set_num_threads(target)
+                    tqdm.write(f"[ThreadAlloc] Adjusted to {target} torch thread(s) "
+                               f"({alloc.get('active', '?')} worker(s) still active).")
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                pass  # file not written yet, or caught mid-write - just retry next cycle
+            self._stop_event.wait(self.poll_interval)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.poll_interval + 1)
+
+
 class WeekRolloverCallback(BaseCallback):
     def __init__(self, verbose=0):
         super().__init__(verbose)
@@ -434,9 +478,17 @@ def run_wfo_pipeline(
     model_dir: str = "./models",
     tb_log_name: str = "SAC_Pretrain",
     num_torch_threads: Optional[int] = None,
+    thread_alloc_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     if num_torch_threads is not None:
         torch.set_num_threads(num_torch_threads)
+
+    # If given (by a sweep driver running several configs in parallel), watches
+    # thread_alloc_path for updated thread-count recommendations as sibling configs
+    # finish, so this run can absorb logical cores they free up instead of being stuck at
+    # its launch-time allocation for its entire (possibly much longer) remaining runtime.
+    thread_poller = ThreadAllocPoller(thread_alloc_path)
+    thread_poller.start()
 
     os.makedirs(model_dir, exist_ok=True)
     df = prepare_data(csv_path)
@@ -631,6 +683,7 @@ def run_wfo_pipeline(
         print_backtest_summary("TEST SEGMENT RESULTS (only inspect once, for the already-chosen winner)", test_metrics)
         results["test"] = test_metrics
 
+    thread_poller.stop()
     return results
 
 def generate_dummy_csv(path="dummy_xauusd.csv"):

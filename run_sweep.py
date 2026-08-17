@@ -54,6 +54,19 @@ SMOKE_CONFIGS: List[Dict[str, Any]] = [
 REAL_CSV = "data/data.csv"
 
 
+def write_thread_alloc(thread_alloc_path: str, active: int, logical_cores: int) -> None:
+    """Atomically (write-temp-then-replace) update the shared status file each worker's
+    ThreadAllocPoller (xau.py) watches, so configs still running can absorb logical cores
+    freed up by ones that already finished instead of being stuck at their launch-time
+    allocation - configs with more pretrain steps/gradient steps take meaningfully longer
+    than others in the same sweep, so this matters even within one Phase 1 run."""
+    alloc = {"active": active, "threads_per_worker": max(1, logical_cores // max(1, active))}
+    tmp_path = thread_alloc_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(alloc, f)
+    os.replace(tmp_path, thread_alloc_path)
+
+
 def run_one(
     config: Dict[str, Any],
     csv_path: str,
@@ -61,6 +74,7 @@ def run_one(
     seed: int,
     num_torch_threads: Optional[int],
     extra_kwargs: Dict[str, Any],
+    thread_alloc_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     name = config["name"]
     run_dir = os.path.join(sweep_dir, name)
@@ -80,6 +94,7 @@ def run_one(
                 model_dir=model_dir,
                 tb_log_name=f"SAC_Pretrain_{name}",
                 num_torch_threads=num_torch_threads,
+                thread_alloc_path=thread_alloc_path,
                 **extra_kwargs,
             )
             results["config"] = config
@@ -121,14 +136,22 @@ def main():
     logical_cores = os.cpu_count() or args.max_parallel
     num_torch_threads = max(1, logical_cores // args.max_parallel)
 
+    # Number still running (starts at len(configs), decremented as each future
+    # completes) - written to thread_alloc_path so surviving workers' ThreadAllocPoller
+    # (xau.py) can pick up freed cores from configs that finished early.
+    active_count = len(configs)
+    thread_alloc_path = os.path.join(args.sweep_dir, "_thread_alloc.json")
+    write_thread_alloc(thread_alloc_path, active_count, logical_cores)
+
     print(f"Launching {len(configs)} config(s), max {args.max_parallel} in parallel, "
-          f"{num_torch_threads} torch thread(s) per worker...")
+          f"{num_torch_threads} torch thread(s) per worker (dynamically reallocated as "
+          f"configs finish)...")
     started_at = time.time()
 
     results_by_name: Dict[str, Dict[str, Any]] = {}
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_parallel) as executor:
         futures = {
-            executor.submit(run_one, cfg, csv_path, args.sweep_dir, args.seed, num_torch_threads, extra_kwargs): cfg["name"]
+            executor.submit(run_one, cfg, csv_path, args.sweep_dir, args.seed, num_torch_threads, extra_kwargs, thread_alloc_path): cfg["name"]
             for cfg in configs
         }
         for future in concurrent.futures.as_completed(futures):
@@ -145,6 +168,9 @@ def main():
                 print(f"[CRASH] {name}: {e}")
                 result = {"config": {"name": name}, "status": "crash", "error": str(e)}
             results_by_name[name] = result
+
+            active_count -= 1
+            write_thread_alloc(thread_alloc_path, active_count, logical_cores)
 
     elapsed = time.time() - started_at
     print(f"\nAll runs finished in {elapsed/60:.1f} minutes.")
