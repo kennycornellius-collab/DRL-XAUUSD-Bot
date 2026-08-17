@@ -16,7 +16,7 @@ from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from features import compute_m15_features
+from features import compute_m15_features, MARKET_FEATURE_COLUMNS
 
 
 def prepare_data(csv_path: str) -> pd.DataFrame:
@@ -42,7 +42,12 @@ class XAUEnv(gym.Env):
         self.initial_balance = initial_balance
         self.initial_peak_balance = initial_peak_balance if initial_peak_balance is not None else initial_balance
 
-        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(9,), dtype=np.float32)
+        # len(MARKET_FEATURE_COLUMNS) window-normalized market features (see _get_obs)
+        # + 5 state features appended directly: position, unrealized PnL, drawdown,
+        # session_sin, session_cos (the latter two are already bounded in [-1, 1] by
+        # construction, so they skip the rolling-window normalization the market
+        # features go through).
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(len(MARKET_FEATURE_COLUMNS) + 5,), dtype=np.float32)
 
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
@@ -75,10 +80,7 @@ class XAUEnv(gym.Env):
 
     def _append_history(self):
         row = self.df.iloc[self.current_step]
-        feats = np.array([
-            row['open'], row['high'], row['low'], 
-            row['close'], row['volume'], row['adx']
-        ], dtype=np.float32)
+        feats = np.array([row[c] for c in MARKET_FEATURE_COLUMNS], dtype=np.float32)
         self.history_200.append(feats)
 
     def step(self, action: np.ndarray):
@@ -188,7 +190,15 @@ class XAUEnv(gym.Env):
         ur_pnl = np.clip(self.current_unrealized_pnl / 100.0, -1.0, 1.0)
         dd = np.clip(self.current_dd, -1.0, 1.0)
 
-        return np.concatenate([scaled, [pos, ur_pnl, dd]]).astype(np.float32)
+        # session_sin/session_cos are computed straight from the row's own timestamp in
+        # features.py and already lie in [-1, 1] - read directly, no rolling-window
+        # normalization needed (or wanted - it would distort their cyclical meaning).
+        row_idx = min(self.current_step, len(self.df) - 1)
+        session_row = self.df.iloc[row_idx]
+        session_sin = float(session_row['session_sin'])
+        session_cos = float(session_row['session_cos'])
+
+        return np.concatenate([scaled, [pos, ur_pnl, dd, session_sin, session_cos]]).astype(np.float32)
 
 
 class WeeklyRollingBuffer(ReplayBuffer):
@@ -353,20 +363,35 @@ def compute_weekly_pnl_distribution(weekly_pnl: List[float]) -> Dict[str, float]
     }
 
 
+def compute_buy_hold_metrics(start_price: float, end_price: float, strategy_net_profit_pct: float) -> Dict[str, float]:
+    """The bar the strategy actually needs to clear: simply buying and holding the same
+    instrument over the same window, with zero trades and zero effort."""
+    buy_hold_return_pct = (end_price - start_price) / start_price * 100 if start_price else 0.0
+    return {
+        "buy_hold_return_pct": float(buy_hold_return_pct),
+        "vs_buy_hold_pct": float(strategy_net_profit_pct - buy_hold_return_pct),
+    }
+
+
 def build_segment_metrics(
     equity_curve: List[float],
     weekly_returns: List[float],
     weekly_pnl: List[float],
     trades: List[Dict[str, Any]],
+    start_price: Optional[float] = None,
+    end_price: Optional[float] = None,
 ) -> Dict[str, float]:
     """Combines the equity-curve-level metrics (net profit, max DD) with trade-level
-    stats, risk-adjusted return, and weekly P&L distribution into one flat dict, so
-    callers still get the same start_balance/end_balance/... keys smoke_test.py already
-    asserts on, plus the new tearsheet fields alongside them."""
+    stats, risk-adjusted return, weekly P&L distribution, and (when start_price/end_price
+    are given) the buy-and-hold comparison into one flat dict, so callers still get the
+    same start_balance/end_balance/... keys smoke_test.py already asserts on, plus the
+    new tearsheet fields alongside them."""
     metrics = compute_backtest_metrics(equity_curve)
     metrics.update(compute_trade_stats(trades))
     metrics.update(compute_sharpe_sortino(weekly_returns))
     metrics.update(compute_weekly_pnl_distribution(weekly_pnl))
+    if start_price is not None and end_price is not None:
+        metrics.update(compute_buy_hold_metrics(start_price, end_price, metrics["net_profit_pct"]))
     return metrics
 
 
@@ -390,6 +415,8 @@ def print_backtest_summary(title: str, metrics: Dict[str, float]) -> None:
         print(f"Weekly PnL:        mean ${metrics['weekly_pnl_mean']:,.2f} | std ${metrics['weekly_pnl_std']:,.2f} | "
               f"{metrics['pct_weeks_profitable']:.1f}% weeks profitable")
         print(f"Best/Worst Week:   ${metrics['best_week_pnl']:,.2f} / ${metrics['worst_week_pnl']:,.2f}")
+    if "buy_hold_return_pct" in metrics:
+        print(f"Buy & Hold:        {metrics['buy_hold_return_pct']:+.2f}% (strategy vs. buy & hold: {metrics['vs_buy_hold_pct']:+.2f} pts)")
     print("="*50 + "\n")
 
 
@@ -457,6 +484,10 @@ def run_wfo_pipeline(
     trades: List[Dict[str, Any]] = []
     weekly_pnl: List[float] = []
     weekly_returns: List[float] = []
+    # Per-week open/close gold price, parallel to equity_curve_weeks - lets the buy-and-hold
+    # benchmark be computed over the exact same windows as the strategy's own metrics.
+    week_open_prices: List[float] = []
+    week_close_prices: List[float] = []
 
     for step_idx, w in enumerate(tqdm(walk_forward_weeks, desc="WFO Progress", unit="week")):
         w_df = df[df['week_label'] == w].copy()
@@ -514,6 +545,8 @@ def run_wfo_pipeline(
         start_of_week_balance = oos_equity_curve[-1]
         weekly_pnl.append(ep_pnl)
         weekly_returns.append(ep_pnl / start_of_week_balance if start_of_week_balance else 0.0)
+        week_open_prices.append(float(w_df.iloc[0]['open']))
+        week_close_prices.append(float(w_df.iloc[-1]['close']))
 
         new_balance = oos_equity_curve[-1] + ep_pnl
         oos_equity_curve.append(new_balance)
@@ -537,30 +570,45 @@ def run_wfo_pipeline(
         elapsed = time.time() - loop_start
         tqdm.write(f"| WFO Complete: {w} | Reward: {ep_reward:7.2f} | PnL: ${ep_pnl:7.2f} | Buffer Occ: {occupancy}/{buffer_size} | Time: {elapsed:5.2f}s |")
 
-    full_metrics = build_segment_metrics(oos_equity_curve, weekly_returns, weekly_pnl, trades)
+    full_metrics = build_segment_metrics(
+        oos_equity_curve, weekly_returns, weekly_pnl, trades,
+        start_price=week_open_prices[0] if week_open_prices else None,
+        end_price=week_close_prices[-1] if week_close_prices else None,
+    )
     print_backtest_summary("WALK-FORWARD OUT-OF-SAMPLE BACKTEST RESULTS (FULL)", full_metrics)
 
-    # Split the equity curve (and the parallel weekly-return/PnL/trade records) at the
-    # validation/test boundary using the weeks that were actually processed (some weeks
-    # may have been skipped via min_week_rows), so config selection can be based on the
-    # validation segment alone without touching test.
+    # Split the equity curve (and the parallel weekly-return/PnL/trade/price records) at
+    # the validation/test boundary using the weeks that were actually processed (some
+    # weeks may have been skipped via min_week_rows), so config selection can be based on
+    # the validation segment alone without touching test.
     val_curve = [oos_equity_curve[0]]
     val_returns: List[float] = []
     val_pnl: List[float] = []
+    val_open_price: Optional[float] = None
+    val_close_price: Optional[float] = None
     test_curve: Optional[List[float]] = None
     test_returns: List[float] = []
     test_pnl: List[float] = []
-    for w, bal, wret, wpnl in zip(equity_curve_weeks, oos_equity_curve[1:], weekly_returns, weekly_pnl):
+    test_open_price: Optional[float] = None
+    test_close_price: Optional[float] = None
+    for w, bal, wret, wpnl, wopen, wclose in zip(
+        equity_curve_weeks, oos_equity_curve[1:], weekly_returns, weekly_pnl, week_open_prices, week_close_prices
+    ):
         if w in validation_weeks:
             val_curve.append(bal)
             val_returns.append(wret)
             val_pnl.append(wpnl)
+            if val_open_price is None:
+                val_open_price = wopen
+            val_close_price = wclose
         elif w in test_weeks:
             if test_curve is None:
                 test_curve = [val_curve[-1]]
+                test_open_price = wopen
             test_curve.append(bal)
             test_returns.append(wret)
             test_pnl.append(wpnl)
+            test_close_price = wclose
 
     val_trades = [t for t in trades if t["week"] in validation_weeks]
     test_trades = [t for t in trades if t["week"] in test_weeks]
@@ -574,12 +622,12 @@ def run_wfo_pipeline(
     }
 
     if len(val_curve) > 1:
-        val_metrics = build_segment_metrics(val_curve, val_returns, val_pnl, val_trades)
+        val_metrics = build_segment_metrics(val_curve, val_returns, val_pnl, val_trades, val_open_price, val_close_price)
         print_backtest_summary("VALIDATION SEGMENT RESULTS", val_metrics)
         results["validation"] = val_metrics
 
     if test_curve and len(test_curve) > 1:
-        test_metrics = build_segment_metrics(test_curve, test_returns, test_pnl, test_trades)
+        test_metrics = build_segment_metrics(test_curve, test_returns, test_pnl, test_trades, test_open_price, test_close_price)
         print_backtest_summary("TEST SEGMENT RESULTS (only inspect once, for the already-chosen winner)", test_metrics)
         results["test"] = test_metrics
 

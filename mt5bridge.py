@@ -9,7 +9,7 @@ import MetaTrader5 as mt5
 
 from stable_baselines3 import SAC
 
-from features import compute_m15_features
+from features import compute_m15_features, MARKET_FEATURE_COLUMNS
 
 SYMBOL = "XAUUSDm"
 TIMEFRAME = mt5.TIMEFRAME_M15 
@@ -61,9 +61,11 @@ def get_drl_observation():
     global PEAK_BALANCE
 
     # Pulled at M5 and resampled here (via compute_m15_features) rather than
-    # fetched directly at M15, so the live ADX matches training's
-    # M5-then-merge pipeline instead of a different M15-native calculation.
-    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 1000)
+    # fetched directly at M15, so the live features match training's M5-then-merge
+    # pipeline instead of a different M15-native calculation. 1500 (not 1000) to leave
+    # comfortable headroom past the trailing-200 window after the adx_h1 feature's own
+    # ~14-hour H1 warmup (on top of the M5 indicators' own warmup) is dropped.
+    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M5, 0, 1500)
     if rates is None:
         print("Failed to get MT5 rates.")
         return None
@@ -74,11 +76,11 @@ def get_drl_observation():
 
     df_m15 = compute_m15_features(df_m5)
 
-    hist_df = df_m15[['open', 'high', 'low', 'close', 'volume', 'adx']].tail(200)
+    hist_df = df_m15[MARKET_FEATURE_COLUMNS].tail(200)
     if len(hist_df) < 200:
         print("Not enough clean data. Waiting")
         return None
-        
+
     hist = hist_df.values.astype(np.float32)
 
     mins = hist.min(axis=0)
@@ -86,10 +88,16 @@ def get_drl_observation():
     ranges = maxs - mins
     ranges[ranges == 0] = 1e-8
 
-    current_features = hist[-1] 
+    current_features = hist[-1]
     scaled = (current_features - mins) / ranges
     scaled = (scaled * 2.0) - 1.0
     scaled = np.clip(scaled, -1.0, 1.0)
+
+    # session_sin/session_cos already lie in [-1, 1] by construction (see features.py) -
+    # read directly from the latest M15 row, no rolling-window normalization.
+    latest_row = df_m15.iloc[-1]
+    session_sin = float(latest_row['session_sin'])
+    session_cos = float(latest_row['session_cos'])
 
     account_info = mt5.account_info()
     if account_info is None:
@@ -120,7 +128,7 @@ def get_drl_observation():
     ur_pnl = np.clip(ur_pnl, -1.0, 1.0)
     dd = np.clip(current_dd, -1.0, 1.0)
 
-    obs = np.concatenate([scaled, [pos_val, ur_pnl, dd]]).astype(np.float32)
+    obs = np.concatenate([scaled, [pos_val, ur_pnl, dd, session_sin, session_cos]]).astype(np.float32)
     return obs, int(pos_val)
 
 def close_all_positions():
