@@ -83,6 +83,7 @@ class XAUEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         act_val = action[0]
+        position_before = self.position
 
         if act_val < -0.3:
             new_pos = -1
@@ -107,8 +108,8 @@ class XAUEnv(gym.Env):
         else:
             next_close = self.df.iloc[self.current_step]['close']
 
-        step_pnl = self.position * (next_close - current_close)
-        step_return = step_pnl - spread_cost
+        price_pnl = position_before * (next_close - current_close)
+        step_return = price_pnl - spread_cost
         
         self.returns_50.append(step_return)
         self.balance += step_return
@@ -145,7 +146,15 @@ class XAUEnv(gym.Env):
             "week_label": self.current_week_label() if not done else self.df.iloc[-1]['week_label'],
             "step_pnl": step_return,
             "balance": self.balance,
-            "peak_balance": self.peak_balance
+            "peak_balance": self.peak_balance,
+            # Exposed for trade-level tearsheet stats (win rate, profit factor, duration)
+            # built in run_wfo_pipeline - position_before/price_pnl attribute this bar's
+            # price move to the trade that was actually open during it, while
+            # position_after/spread_cost attribute the entry fee (if any) to the new trade.
+            "position_before": position_before,
+            "position_after": new_pos,
+            "price_pnl": price_pnl,
+            "spread_cost": spread_cost,
         }
         return self._get_obs(), float(reward), done, truncated, info
 
@@ -258,6 +267,96 @@ def compute_backtest_metrics(equity_curve: List[float]) -> Dict[str, float]:
     }
 
 
+def compute_trade_stats(trades: List[Dict[str, Any]]) -> Dict[str, float]:
+    """Trades are built in run_wfo_pipeline from consecutive same-direction position
+    bars (see XAUEnv.step's position_before/position_after/price_pnl/spread_cost info
+    fields) - each dict here is {"week", "direction", "pnl", "duration"}."""
+    if not trades:
+        return {
+            "trade_count": 0,
+            "win_rate_pct": 0.0,
+            "profit_factor": 0.0,
+            "avg_trade_duration_bars": 0.0,
+            "avg_trade_duration_hours": 0.0,
+        }
+
+    pnls = np.array([t["pnl"] for t in trades])
+    durations = np.array([t["duration"] for t in trades])
+
+    wins = pnls[pnls > 0]
+    losses = pnls[pnls < 0]
+    gross_profit = float(wins.sum()) if len(wins) else 0.0
+    gross_loss = float(-losses.sum()) if len(losses) else 0.0
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    else:
+        profit_factor = float("inf") if gross_profit > 0 else 0.0
+
+    return {
+        "trade_count": int(len(pnls)),
+        "win_rate_pct": float((pnls > 0).mean() * 100),
+        "profit_factor": float(profit_factor),
+        "avg_trade_duration_bars": float(durations.mean()),
+        "avg_trade_duration_hours": float(durations.mean() * 0.25),  # M15 bars -> hours
+    }
+
+
+def compute_sharpe_sortino(weekly_returns: List[float], periods_per_year: int = 52) -> Dict[str, float]:
+    """weekly_returns are fractional (ep_pnl / start-of-week balance), one per processed
+    walk-forward week - annualized with sqrt(52) since that's the native resolution the
+    walk-forward loop and replay buffer already operate at."""
+    if len(weekly_returns) < 2:
+        return {"sharpe": 0.0, "sortino": 0.0}
+
+    returns = np.array(weekly_returns)
+    mean_ret = returns.mean()
+    std_ret = returns.std()
+    sharpe = float(mean_ret / std_ret * np.sqrt(periods_per_year)) if std_ret > 0 else 0.0
+
+    downside = returns[returns < 0]
+    downside_std = downside.std() if len(downside) >= 2 else 0.0
+    sortino = float(mean_ret / downside_std * np.sqrt(periods_per_year)) if downside_std > 0 else 0.0
+
+    return {"sharpe": sharpe, "sortino": sortino}
+
+
+def compute_weekly_pnl_distribution(weekly_pnl: List[float]) -> Dict[str, float]:
+    if not weekly_pnl:
+        return {
+            "weekly_pnl_mean": 0.0,
+            "weekly_pnl_std": 0.0,
+            "pct_weeks_profitable": 0.0,
+            "best_week_pnl": 0.0,
+            "worst_week_pnl": 0.0,
+        }
+
+    pnl_arr = np.array(weekly_pnl)
+    return {
+        "weekly_pnl_mean": float(pnl_arr.mean()),
+        "weekly_pnl_std": float(pnl_arr.std()),
+        "pct_weeks_profitable": float((pnl_arr > 0).mean() * 100),
+        "best_week_pnl": float(pnl_arr.max()),
+        "worst_week_pnl": float(pnl_arr.min()),
+    }
+
+
+def build_segment_metrics(
+    equity_curve: List[float],
+    weekly_returns: List[float],
+    weekly_pnl: List[float],
+    trades: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    """Combines the equity-curve-level metrics (net profit, max DD) with trade-level
+    stats, risk-adjusted return, and weekly P&L distribution into one flat dict, so
+    callers still get the same start_balance/end_balance/... keys smoke_test.py already
+    asserts on, plus the new tearsheet fields alongside them."""
+    metrics = compute_backtest_metrics(equity_curve)
+    metrics.update(compute_trade_stats(trades))
+    metrics.update(compute_sharpe_sortino(weekly_returns))
+    metrics.update(compute_weekly_pnl_distribution(weekly_pnl))
+    return metrics
+
+
 def print_backtest_summary(title: str, metrics: Dict[str, float]) -> None:
     print("\n" + "="*50)
     print(title)
@@ -266,6 +365,18 @@ def print_backtest_summary(title: str, metrics: Dict[str, float]) -> None:
     print(f"Ending Balance:    ${metrics['end_balance']:,.2f}")
     print(f"Net Profit:        ${metrics['net_profit']:,.2f} ({metrics['net_profit_pct']:+.2f}%)")
     print(f"Max Drawdown:      {metrics['max_drawdown_pct']:.2f}%")
+    if "sharpe" in metrics:
+        print(f"Sharpe (weekly):   {metrics['sharpe']:.2f}")
+        print(f"Sortino (weekly):  {metrics['sortino']:.2f}")
+    if "trade_count" in metrics:
+        pf = metrics['profit_factor']
+        pf_str = "inf" if pf == float("inf") else f"{pf:.2f}"
+        print(f"Trades:            {metrics['trade_count']} | Win Rate: {metrics['win_rate_pct']:.1f}% | Profit Factor: {pf_str}")
+        print(f"Avg Trade Duration: {metrics['avg_trade_duration_bars']:.1f} bars (~{metrics['avg_trade_duration_hours']:.1f}h)")
+    if "weekly_pnl_mean" in metrics:
+        print(f"Weekly PnL:        mean ${metrics['weekly_pnl_mean']:,.2f} | std ${metrics['weekly_pnl_std']:,.2f} | "
+              f"{metrics['pct_weeks_profitable']:.1f}% weeks profitable")
+        print(f"Best/Worst Week:   ${metrics['best_week_pnl']:,.2f} / ${metrics['worst_week_pnl']:,.2f}")
     print("="*50 + "\n")
 
 
@@ -326,6 +437,14 @@ def run_wfo_pipeline(
     equity_curve_weeks: List[str] = []
     running_peak_balance = 10000.0
 
+    # Trade-level and weekly-return records for the tearsheet (compute_trade_stats /
+    # compute_sharpe_sortino / compute_weekly_pnl_distribution below). Positions never
+    # carry across week boundaries (each week gets a fresh XAUEnv), so trades are always
+    # opened and closed within a single week's loop iteration.
+    trades: List[Dict[str, Any]] = []
+    weekly_pnl: List[float] = []
+    weekly_returns: List[float] = []
+
     for step_idx, w in enumerate(tqdm(walk_forward_weeks, desc="WFO Progress", unit="week")):
         w_df = df[df['week_label'] == w].copy()
 
@@ -342,6 +461,7 @@ def run_wfo_pipeline(
         ep_reward = 0.0
         ep_pnl = 0.0
         loop_start = time.time()
+        current_trade: Optional[Dict[str, Any]] = None
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
@@ -350,8 +470,32 @@ def run_wfo_pipeline(
 
             ep_reward += rewards[0]
             ep_pnl += infos[0]['step_pnl']
+
+            # Attribute this bar's price move to whichever trade was open going into it,
+            # and open/close trades on position changes (flat<->position or a direct
+            # reversal), so trade PnL/duration reflect the env's own position bookkeeping
+            # rather than a separate reimplementation of it.
+            pos_before = infos[0]['position_before']
+            pos_after = infos[0]['position_after']
+            if pos_before != 0 and current_trade is not None:
+                current_trade['pnl'] += infos[0]['price_pnl']
+                current_trade['duration'] += 1
+            if pos_after != pos_before:
+                if current_trade is not None:
+                    trades.append(current_trade)
+                    current_trade = None
+                if pos_after != 0:
+                    current_trade = {"week": w, "direction": pos_after, "pnl": -infos[0]['spread_cost'], "duration": 0}
+
             obs = next_obs
             done = dones[0]
+
+        if current_trade is not None:
+            trades.append(current_trade)
+
+        start_of_week_balance = oos_equity_curve[-1]
+        weekly_pnl.append(ep_pnl)
+        weekly_returns.append(ep_pnl / start_of_week_balance if start_of_week_balance else 0.0)
 
         new_balance = oos_equity_curve[-1] + ep_pnl
         oos_equity_curve.append(new_balance)
@@ -375,35 +519,49 @@ def run_wfo_pipeline(
         elapsed = time.time() - loop_start
         tqdm.write(f"| WFO Complete: {w} | Reward: {ep_reward:7.2f} | PnL: ${ep_pnl:7.2f} | Buffer Occ: {occupancy}/{buffer_size} | Time: {elapsed:5.2f}s |")
 
-    full_metrics = compute_backtest_metrics(oos_equity_curve)
+    full_metrics = build_segment_metrics(oos_equity_curve, weekly_returns, weekly_pnl, trades)
     print_backtest_summary("WALK-FORWARD OUT-OF-SAMPLE BACKTEST RESULTS (FULL)", full_metrics)
 
-    # Split the equity curve at the validation/test boundary using the weeks that were
-    # actually processed (some weeks may have been skipped via min_week_rows), so config
-    # selection can be based on the validation segment alone without touching test.
+    # Split the equity curve (and the parallel weekly-return/PnL/trade records) at the
+    # validation/test boundary using the weeks that were actually processed (some weeks
+    # may have been skipped via min_week_rows), so config selection can be based on the
+    # validation segment alone without touching test.
     val_curve = [oos_equity_curve[0]]
+    val_returns: List[float] = []
+    val_pnl: List[float] = []
     test_curve: Optional[List[float]] = None
-    for w, bal in zip(equity_curve_weeks, oos_equity_curve[1:]):
+    test_returns: List[float] = []
+    test_pnl: List[float] = []
+    for w, bal, wret, wpnl in zip(equity_curve_weeks, oos_equity_curve[1:], weekly_returns, weekly_pnl):
         if w in validation_weeks:
             val_curve.append(bal)
+            val_returns.append(wret)
+            val_pnl.append(wpnl)
         elif w in test_weeks:
             if test_curve is None:
                 test_curve = [val_curve[-1]]
             test_curve.append(bal)
+            test_returns.append(wret)
+            test_pnl.append(wpnl)
+
+    val_trades = [t for t in trades if t["week"] in validation_weeks]
+    test_trades = [t for t in trades if t["week"] in test_weeks]
 
     results: Dict[str, Any] = {
         "oos_equity_curve": oos_equity_curve,
         "equity_curve_weeks": equity_curve_weeks,
+        "weekly_pnl": weekly_pnl,
+        "trades": trades,
         "full": full_metrics,
     }
 
     if len(val_curve) > 1:
-        val_metrics = compute_backtest_metrics(val_curve)
+        val_metrics = build_segment_metrics(val_curve, val_returns, val_pnl, val_trades)
         print_backtest_summary("VALIDATION SEGMENT RESULTS", val_metrics)
         results["validation"] = val_metrics
 
     if test_curve and len(test_curve) > 1:
-        test_metrics = compute_backtest_metrics(test_curve)
+        test_metrics = build_segment_metrics(test_curve, test_returns, test_pnl, test_trades)
         print_backtest_summary("TEST SEGMENT RESULTS (only inspect once, for the already-chosen winner)", test_metrics)
         results["test"] = test_metrics
 
