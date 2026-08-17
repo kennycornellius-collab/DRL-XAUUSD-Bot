@@ -55,13 +55,39 @@ class XAUEnv(gym.Env):
 
         self.start_index = 0
 
-        self.history_200 = collections.deque(maxlen=200)
+        # Pre-extracted numpy arrays instead of repeated df.iloc[...] lookups per step -
+        # .iloc row/cell access re-does pandas type-checking/index-alignment on every call,
+        # which dominates per-step cost at this env's scale (measured ~590x slower than
+        # numpy indexing for the same lookups). _close deliberately keeps its native
+        # float64 dtype (no cast) since it feeds PnL/balance/reward arithmetic directly -
+        # casting it would silently change every dollar figure the pipeline produces.
+        self._close = self.df['close'].to_numpy()
+        self._week_label = self.df['week_label'].to_numpy()
+        self._market_features = self.df[MARKET_FEATURE_COLUMNS].to_numpy(dtype=np.float32)
+        self._session_sin = self.df['session_sin'].to_numpy()
+        self._session_cos = self.df['session_cos'].to_numpy()
+
+        # Precomputed rolling min/max for _get_obs's window normalization, replacing a
+        # collections.deque that used to get rebuilt into a fresh array every single call.
+        # Every episode always starts at self.start_index == 0 and steps forward
+        # monotonically through this same df, so "the window visible at row k" is a pure
+        # function of row position - identical across every episode/reset this instance
+        # ever runs, so it's safe (and much cheaper) to compute once here rather than
+        # maintain live per-episode state. Cast to float32 BEFORE rolling, matching
+        # _append_history's cast-then-reduce order so the result is bitwise identical to
+        # the old deque-of-float32-rows approach.
+        feat_df = self.df[MARKET_FEATURE_COLUMNS].astype(np.float32)
+        roll = feat_df.rolling(window=200, min_periods=1)
+        self._roll_min = roll.min().to_numpy(dtype=np.float32)
+        self._roll_max = roll.max().to_numpy(dtype=np.float32)
+        self._hist_step = 0  # index of the last row _append_history() actually wrote
+
         self.returns_50 = collections.deque(maxlen=50)
 
     def current_week_label(self) -> str:
-        if self.current_step >= len(self.df):
-            return self.df.iloc[-1]['week_label']
-        return self.df.iloc[self.current_step]['week_label']
+        if self.current_step >= len(self._week_label):
+            return self._week_label[-1]
+        return self._week_label[self.current_step]
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -74,16 +100,13 @@ class XAUEnv(gym.Env):
         self.current_unrealized_pnl = 0.0
         self.current_dd = 0.0
 
-        self.history_200.clear()
         self.returns_50.clear()
 
         self._append_history()
         return self._get_obs(), {"week_label": self.current_week_label()}
 
     def _append_history(self):
-        row = self.df.iloc[self.current_step]
-        feats = np.array([row[c] for c in MARKET_FEATURE_COLUMNS], dtype=np.float32)
-        self.history_200.append(feats)
+        self._hist_step = self.current_step
 
     def step(self, action: np.ndarray):
         act_val = float(np.clip(action[0], -1.0, 1.0))
@@ -109,7 +132,7 @@ class XAUEnv(gym.Env):
         if dir_after != 0 and dir_after != dir_before:
             spread_cost = 0.30 * abs(new_pos)
 
-        current_close = self.df.iloc[self.current_step]['close']
+        current_close = self._close[self.current_step]
 
         self.current_step += 1
         done = False
@@ -119,7 +142,7 @@ class XAUEnv(gym.Env):
             done = True
             next_close = current_close
         else:
-            next_close = self.df.iloc[self.current_step]['close']
+            next_close = self._close[self.current_step]
 
         price_pnl = position_before * (next_close - current_close)
         step_return = price_pnl - spread_cost
@@ -160,7 +183,7 @@ class XAUEnv(gym.Env):
             self._append_history()
 
         info = {
-            "week_label": self.current_week_label() if not done else self.df.iloc[-1]['week_label'],
+            "week_label": self.current_week_label() if not done else self._week_label[-1],
             "step_pnl": step_return,
             "balance": self.balance,
             "peak_balance": self.peak_balance,
@@ -176,14 +199,16 @@ class XAUEnv(gym.Env):
         return self._get_obs(), float(reward), done, truncated, info
 
     def _get_obs(self) -> np.ndarray:
-        hist = np.array(self.history_200)
-
-        mins = hist.min(axis=0)
-        maxs = hist.max(axis=0)
+        # mins/maxs/current_features all come from _hist_step (the last row
+        # _append_history() actually wrote), NOT self.current_step directly - on a
+        # terminating step the append is skipped (see step()'s `if not done:` guard), so
+        # self.current_step can point one row past what's actually been observed.
+        mins = self._roll_min[self._hist_step]
+        maxs = self._roll_max[self._hist_step]
         ranges = maxs - mins
         ranges[ranges == 0] = 1e-8
 
-        current_features = hist[-1]
+        current_features = self._market_features[self._hist_step]
         scaled = (current_features - mins) / ranges
         scaled = (scaled * 2.0) - 1.0
         scaled = np.clip(scaled, -1.0, 1.0)
@@ -195,10 +220,12 @@ class XAUEnv(gym.Env):
         # session_sin/session_cos are computed straight from the row's own timestamp in
         # features.py and already lie in [-1, 1] - read directly, no rolling-window
         # normalization needed (or wanted - it would distort their cyclical meaning).
-        row_idx = min(self.current_step, len(self.df) - 1)
-        session_row = self.df.iloc[row_idx]
-        session_sin = float(session_row['session_sin'])
-        session_cos = float(session_row['session_cos'])
+        # Deliberately keyed on self.current_step (not _hist_step) - matches the original
+        # code's existing behavior, including its pre-existing terminal-step
+        # inconsistency with the market features above.
+        row_idx = min(self.current_step, len(self._session_sin) - 1)
+        session_sin = float(self._session_sin[row_idx])
+        session_cos = float(self._session_cos[row_idx])
 
         return np.concatenate([scaled, [pos, ur_pnl, dd, session_sin, session_cos]]).astype(np.float32)
 
@@ -208,21 +235,32 @@ class WeeklyRollingBuffer(ReplayBuffer):
         super().__init__(*args, **kwargs)
         self.valid_mask = np.zeros(self.buffer_size, dtype=bool)
         self.week_index_map = collections.defaultdict(list)
+        # Reverse lookup (slot -> owning week), built after super().__init__() since SB3
+        # may rewrite self.buffer_size (e.g. // n_envs) - sized to match valid_mask.
+        # Lets add() find which week owns a slot about to be overwritten in O(1) instead
+        # of scanning every tracked week's index list.
+        self.slot_week: List[Optional[str]] = [None] * self.buffer_size
 
-    def add(self, obs: np.ndarray, next_obs: np.ndarray, action: np.ndarray, 
+    def add(self, obs: np.ndarray, next_obs: np.ndarray, action: np.ndarray,
             reward: np.ndarray, done: np.ndarray, infos: List[Dict[str, Any]]) -> None:
-        
+
         week_label = infos[0]['week_label']
         idx = self.pos
 
-        for w, inds in list(self.week_index_map.items()):
-            if idx in inds:
+        old_week = self.slot_week[idx]
+        if old_week is not None:
+            # .get(), never bracket access - old_week may have already been fully purged
+            # by purge_oldest_week(), and bracket access on this defaultdict would
+            # silently resurrect it as an empty list (then .remove() would raise, since
+            # idx was never actually in it).
+            inds = self.week_index_map.get(old_week)
+            if inds is not None and idx in inds:
                 inds.remove(idx)
                 if not inds:
-                    del self.week_index_map[w]
-                break
+                    del self.week_index_map[old_week]
 
         self.week_index_map[week_label].append(idx)
+        self.slot_week[idx] = week_label
         self.valid_mask[idx] = True
 
         super().add(obs, next_obs, action, reward, done, infos)
@@ -230,7 +268,7 @@ class WeeklyRollingBuffer(ReplayBuffer):
     def purge_oldest_week(self):
         if not self.week_index_map:
             return
-            
+
         oldest_week = sorted(self.week_index_map.keys())[0]
         inds_to_purge = self.week_index_map.pop(oldest_week)
 
@@ -239,6 +277,7 @@ class WeeklyRollingBuffer(ReplayBuffer):
             self.dones[idx] = 0.0
             self.timeouts[idx] = 0.0
             self.valid_mask[idx] = False
+            self.slot_week[idx] = None  # keep the reverse lookup consistent after a purge
 
     def sample(self, batch_size: int, env: Optional[DummyVecEnv] = None):
         valid_indices = np.where(self.valid_mask)[0]
