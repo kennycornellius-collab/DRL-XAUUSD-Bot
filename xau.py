@@ -82,7 +82,11 @@ class XAUEnv(gym.Env):
         self._roll_max = roll.max().to_numpy(dtype=np.float32)
         self._hist_step = 0  # index of the last row _append_history() actually wrote
 
-        self.returns_50 = collections.deque(maxlen=50)
+        # Widened from 50 (12.5h) to 200 steps (~50h / ~2 days) - matches the observation's
+        # own 200-candle window, and comfortably fits within a single week's WFO episode
+        # so the downside_std estimate below actually has room to stabilize instead of
+        # reacting to whatever handful of bars happened in the last 12.5 hours.
+        self.returns_200 = collections.deque(maxlen=200)
 
     def current_week_label(self) -> str:
         if self.current_step >= len(self._week_label):
@@ -100,7 +104,7 @@ class XAUEnv(gym.Env):
         self.current_unrealized_pnl = 0.0
         self.current_dd = 0.0
 
-        self.returns_50.clear()
+        self.returns_200.clear()
 
         self._append_history()
         return self._get_obs(), {"week_label": self.current_week_label()}
@@ -147,15 +151,15 @@ class XAUEnv(gym.Env):
         price_pnl = position_before * (next_close - current_close)
         step_return = price_pnl - spread_cost
         
-        self.returns_50.append(step_return)
+        self.returns_200.append(step_return)
         self.balance += step_return
-        
+
         if self.balance > self.peak_balance:
             self.peak_balance = self.balance
 
         self.current_dd = (self.peak_balance - self.balance) / self.peak_balance if self.peak_balance > 0 else 0.0
-        
-        neg_returns = [r for r in self.returns_50 if r < 0]
+
+        neg_returns = [r for r in self.returns_200 if r < 0]
         downside_std = np.std(neg_returns) if len(neg_returns) >= 2 else 1.0
 
         reward = step_return / (downside_std + 1e-8)
