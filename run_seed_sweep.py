@@ -194,7 +194,8 @@ def main():
             "runs": all_results,
         }, f, indent=2, default=str)
     print(f"\nFull per-seed results + this summary saved to {summary_path}")
-    print(f"For a follow-up ensemble_eval.py call, pass:  --phase1-sweep-dir {args.phase1_sweep_dir}  --seed-sweep-dir {run_dir}")
+    phase1_hint = f"--phase1-sweep-dir {args.phase1_sweep_dir}  " if args.reuse_seed42 else ""
+    print(f"For a follow-up ensemble_eval.py call, pass:  {phase1_hint}--seed-sweep-dir {run_dir}")
 
 
 if __name__ == "__main__":

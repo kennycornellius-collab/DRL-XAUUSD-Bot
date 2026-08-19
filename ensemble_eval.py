@@ -18,24 +18,33 @@ trained on w's own data (lookahead bias).
 Reporting mirrors every prior era's Phase 1/Phase 2 protocol: validation-only ranking
 between combine methods first, test revealed only for the validation-ranked winner.
 
---phase1-sweep-dir and --seed-sweep-dir must point at the exact timestamped
-run_sweep.py/run_seed_sweep.py output directories being evaluated (as printed by those
-scripts, e.g. sweep_runs/20260819_195817 and sweep_runs_seeds/20260819_195954) - there
-is no bare-folder default, since a run_id-less "sweep_runs" no longer identifies a
-single run. This script's own output (<winner-name>_ensemble_summary.json) is written
-into --seed-sweep-dir alongside the seeds it evaluated, not a fresh timestamp, since it
-isn't producing new trained artifacts.
+--seed-sweep-dir must point at the exact timestamped run_seed_sweep.py output directory
+being evaluated (as printed by that script, e.g. sweep_runs_seeds/20260819_195954) -
+there is no bare-folder default, since a run_id-less "sweep_runs_seeds" no longer
+identifies a single run. This script's own output (<winner-name>_ensemble_summary.json)
+is written into --seed-sweep-dir alongside the seeds it evaluated, not a fresh
+timestamp, since it isn't producing new trained artifacts.
+
+--phase1-sweep-dir is only needed if run_seed_sweep.py reused an existing Phase 1 seed
+42 (its default behavior) rather than training all seeds fresh via --no-reuse-seed42 -
+in that case it must point at that Phase 1 run's exact directory, e.g.
+sweep_runs/20260819_195817. Omit it when every seed (including 42) was trained by the
+same run_seed_sweep.py invocation.
 
 Usage:
-    # Full 5-seed ensemble, both combine methods
+    # Full 5-seed ensemble, both combine methods - seed 42 reused from Phase 1
     python ensemble_eval.py --winner-name 150k_500_256 \
         --phase1-sweep-dir sweep_runs/20260819_195817 \
         --seed-sweep-dir sweep_runs_seeds/20260819_195954
 
+    # Same, but all 5 seeds (including 42) were trained together via
+    # run_seed_sweep.py --no-reuse-seed42 - no --phase1-sweep-dir needed
+    python ensemble_eval.py --winner-name 150k_500_256 \
+        --seed-sweep-dir sweep_runs_seeds/20260820_090000
+
     # Single-seed replay check (see plan.md verification step 2) - a 1-seed "ensemble"
     # must reproduce that seed's already-recorded results.json numbers almost exactly
     python ensemble_eval.py --winner-name 150k_500_256 --seeds 43 --combine mean \
-        --phase1-sweep-dir sweep_runs/20260819_195817 \
         --seed-sweep-dir sweep_runs_seeds/20260819_195954
 """
 import argparse
@@ -53,14 +62,23 @@ from xau import prepare_data, XAUEnv, rollout_week, build_segment_metrics, print
 REAL_CSV = "data/data.csv"
 
 
-def seed_model_dir(winner_name: str, seed: int, phase1_sweep_dir: str, seed_sweep_dir: str) -> str:
-    """Mirrors the two-location layout run_sweep.py/run_seed_sweep.py actually produced:
-    seed 42's checkpoints live under the Phase 1 sweep dir (run_seed_sweep.py reuses that
-    seed's existing result instead of retraining it), every other seed under
-    seed_sweep_dir/<winner_name>_seed<N>/."""
-    if seed == 42:
-        return os.path.join(phase1_sweep_dir, winner_name, "models")
-    return os.path.join(seed_sweep_dir, f"{winner_name}_seed{seed}", "models")
+def seed_model_dir(winner_name: str, seed: int, phase1_sweep_dir: Optional[str], seed_sweep_dir: str) -> str:
+    """run_seed_sweep.py produces checkpoints in one of two layouts depending on whether
+    it reused seed 42 from an existing Phase 1 run (the default) or trained every seed
+    fresh via --no-reuse-seed42: reused seed 42 lives under the Phase 1 sweep dir, while
+    every seed trained by run_seed_sweep.py itself (including seed 42 when run fresh)
+    lives under seed_sweep_dir/<winner_name>_seed<N>/. Prefer the seed_sweep_dir location
+    whenever it actually exists there, and fall back to phase1_sweep_dir only for the
+    reused-seed-42 case."""
+    same_dir_path = os.path.join(seed_sweep_dir, f"{winner_name}_seed{seed}", "models")
+    if os.path.exists(os.path.join(same_dir_path, "sac_xauusd_pretrained.zip")):
+        return same_dir_path
+    if phase1_sweep_dir is None:
+        raise SystemExit(
+            f"No checkpoint for seed {seed} under {same_dir_path}, and --phase1-sweep-dir "
+            f"was not given to fall back to (needed for a reused seed 42)."
+        )
+    return os.path.join(phase1_sweep_dir, winner_name, "models")
 
 
 def week_checkpoint_path(model_dir: str, prev_processed_week: Optional[str]) -> str:
@@ -88,7 +106,7 @@ def run_ensemble(
     pretrain_weeks_count: int,
     val_weeks_count: int,
     min_week_rows: int,
-    phase1_sweep_dir: str,
+    phase1_sweep_dir: Optional[str],
     seed_sweep_dir: str,
 ) -> Dict[str, Any]:
     weeks = sorted(df['week_label'].unique())
@@ -205,7 +223,7 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46])
     parser.add_argument("--combine", choices=["mean", "median", "both"], default="both")
     parser.add_argument("--csv", default=REAL_CSV)
-    parser.add_argument("--phase1-sweep-dir", required=True, help="Exact timestamped run_sweep.py output directory holding seed 42's checkpoints, e.g. sweep_runs/20260819_195817.")
+    parser.add_argument("--phase1-sweep-dir", default=None, help="Exact timestamped run_sweep.py output directory holding a reused seed 42's checkpoints, e.g. sweep_runs/20260819_195817. Only needed if seed 42 isn't already present under --seed-sweep-dir (i.e. run_seed_sweep.py reused it from Phase 1 rather than training it fresh).")
     parser.add_argument("--seed-sweep-dir", required=True, help="Exact timestamped run_seed_sweep.py output directory holding seeds 43-46's checkpoints, e.g. sweep_runs_seeds/20260819_195954.")
     parser.add_argument("--pretrain-weeks-count", type=int, default=26)
     parser.add_argument("--val-weeks-count", type=int, default=79)
