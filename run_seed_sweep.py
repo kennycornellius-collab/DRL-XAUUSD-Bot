@@ -10,16 +10,25 @@ sweep_common.py).
 The winner's seed=42 result already exists from its run_sweep.py run
 (<phase1-sweep-dir>/<winner-name>/results.json) - by default this script loads that
 instead of re-running seed 42, and only launches the additional seeds requested.
+--phase1-sweep-dir must point at that Phase 1 run's exact timestamped directory (as
+printed by run_sweep.py, e.g. sweep_runs/20260819_195817) - it is required, not
+defaulted, because a bare "sweep_runs" no longer identifies a single run.
+
+This run's own output goes under <seed-sweep-dir>/<run_id>/ (run_id defaults to the
+launch timestamp), so two separate seed sweeps that happen to pick the same winning
+config name can never collide - this bit a real run on 2026-08-19, when a later era's
+Phase 2 silently overwrote an earlier era's trained checkpoints because both wrote to
+the same config-name subdirectory with no run identifier.
 
 Usage:
     # Auto-load hyperparams + reuse the existing seed=42 result from Phase 1
-    python run_seed_sweep.py --winner-name 50k_1000_256
+    python run_seed_sweep.py --winner-name 50k_1000_256 --phase1-sweep-dir sweep_runs/20260819_195817
 
     # Custom seed list (default is 43 44 45 46 -> 5 seeds total with the reused 42)
-    python run_seed_sweep.py --winner-name 50k_1000_256 --seeds 43 44 45 46 47
+    python run_seed_sweep.py --winner-name 50k_1000_256 --phase1-sweep-dir sweep_runs/20260819_195817 --seeds 43 44 45 46 47
 
     # Run all seeds fresh instead of reusing Phase 1's seed=42 (e.g. config wasn't
-    # part of Phase 1, or sweep_runs/ has been cleaned up)
+    # part of Phase 1, or its sweep_runs/<run_id> has been archived/cleaned up)
     python run_seed_sweep.py --winner-name my_config --no-reuse-seed42 \
         --pretrain-timesteps 50000 --gradient-steps 1000 --batch-size 256 \
         --seeds 42 43 44 45 46
@@ -29,6 +38,7 @@ import json
 import os
 import statistics
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sweep_common import run_parallel
@@ -56,8 +66,9 @@ def mean_std(values: List[float]) -> Dict[str, Any]:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--winner-name", required=True, help="Name for this config's seed runs (also the Phase 1 config directory name, if auto-loading hyperparams).")
-    parser.add_argument("--phase1-sweep-dir", default="sweep_runs")
+    parser.add_argument("--phase1-sweep-dir", default=None, help="Exact timestamped run_sweep.py output directory to reuse seed 42 from, e.g. sweep_runs/20260819_195817 (required unless --no-reuse-seed42).")
     parser.add_argument("--seed-sweep-dir", default="sweep_runs_seeds")
+    parser.add_argument("--run-id", default=None, help="Subdirectory name under --seed-sweep-dir for this run's own output. Defaults to the launch timestamp so separate runs can never collide.")
     parser.add_argument("--pretrain-timesteps", type=int, default=None)
     parser.add_argument("--gradient-steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -79,6 +90,13 @@ def main():
 
     existing_seed42_result = None
     if args.reuse_seed42:
+        if args.phase1_sweep_dir is None:
+            raise SystemExit(
+                "--phase1-sweep-dir is required when reusing seed 42 (the default) - pass the "
+                "exact timestamped directory run_sweep.py printed for that Phase 1 run, e.g. "
+                "sweep_runs/20260819_195817. Pass --no-reuse-seed42 instead to skip this and run "
+                "all seeds fresh."
+            )
         phase1_result = load_phase1_result(args.winner_name, args.phase1_sweep_dir)
         if phase1_result is None:
             raise SystemExit(
@@ -122,11 +140,15 @@ def main():
         "min_week_rows": args.min_week_rows,
     }
 
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.seed_sweep_dir, run_id)
+    print(f"Run directory: {run_dir}")
+
     started_at = time.time()
     results_by_name = run_parallel(
         run_specs=run_specs,
         csv_path=args.csv,
-        sweep_dir=args.seed_sweep_dir,
+        sweep_dir=run_dir,
         max_parallel=args.max_parallel,
         extra_kwargs=extra_kwargs,
     )
@@ -163,8 +185,8 @@ def main():
               f"values={[f'{v:.2f}' for v in d_stats['values']]}")
     print("="*66)
 
-    os.makedirs(args.seed_sweep_dir, exist_ok=True)
-    summary_path = os.path.join(args.seed_sweep_dir, f"{args.winner_name}_seed_summary.json")
+    os.makedirs(run_dir, exist_ok=True)
+    summary_path = os.path.join(run_dir, f"{args.winner_name}_seed_summary.json")
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump({
             "config": {"pretrain_timesteps": pretrain_timesteps, "gradient_steps": gradient_steps, "batch_size": batch_size},
@@ -172,6 +194,7 @@ def main():
             "runs": all_results,
         }, f, indent=2, default=str)
     print(f"\nFull per-seed results + this summary saved to {summary_path}")
+    print(f"For a follow-up ensemble_eval.py call, pass:  --phase1-sweep-dir {args.phase1_sweep_dir}  --seed-sweep-dir {run_dir}")
 
 
 if __name__ == "__main__":

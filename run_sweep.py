@@ -11,12 +11,19 @@ WeeklyRollingBuffer's single-env week-tracking and XAUEnv's sequential week-to-w
 balance/peak carry-over (each week's starting balance depends on the previous week's
 ending balance).
 
-Each config gets its own model_dir/tensorboard log name (no collisions) and its own
-log file under sweep_runs/<name>/log.txt (stdout/stderr redirected there so 4 parallel
-runs don't interleave in the terminal). Results are collected as JSON per run plus an
-aggregated sweep_runs/summary.json, and a ranking table is printed using ONLY the
-validation-segment metrics -- test-segment results are saved to disk but deliberately
-not printed here, so they aren't glanced at before a winner is chosen.
+Each run gets its own timestamped directory under sweep_runs/<run_id>/ (run_id defaults
+to the launch time, e.g. sweep_runs/20260819_195817/) so two separate sweeps can never
+collide even if they happen to pick the same winning config name - this bit a real run
+on 2026-08-19, when a later sweep's Phase 2 silently overwrote an earlier era's trained
+checkpoints because both wrote to the same config-name subdirectory with no run
+identifier. Inside that run_id directory, each config still gets its own
+model_dir/tensorboard log name and its own log file under <name>/log.txt (stdout/stderr
+redirected there so parallel runs don't interleave in the terminal). Results are
+collected as JSON per run plus an aggregated summary.json, and a ranking table is
+printed using ONLY the validation-segment metrics -- test-segment results are saved to
+disk but deliberately not printed here, so they aren't glanced at before a winner is
+chosen. The printed run_id is what a follow-up run_seed_sweep.py/ensemble_eval.py call
+needs to pass as --phase1-sweep-dir (e.g. sweep_runs/20260819_195817).
 
 Usage:
     python run_sweep.py                      # real Phase 1 sweep, 4 parallel workers
@@ -32,6 +39,7 @@ import json
 import os
 import time
 import traceback
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from xau import run_wfo_pipeline
@@ -119,6 +127,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--csv", default=REAL_CSV)
     parser.add_argument("--sweep-dir", default="sweep_runs")
+    parser.add_argument("--run-id", default=None, help="Subdirectory name under --sweep-dir for this run. Defaults to the launch timestamp so separate runs can never collide.")
     parser.add_argument("--smoke", action="store_true", help="Run tiny configs against a small data slice to verify the driver itself.")
     args = parser.parse_args()
 
@@ -131,7 +140,10 @@ def main():
         extra_kwargs = {}
         csv_path = args.csv
 
-    os.makedirs(args.sweep_dir, exist_ok=True)
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(args.sweep_dir, run_id)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Run directory: {run_dir}")
 
     logical_cores = os.cpu_count() or args.max_parallel
     num_torch_threads = max(1, logical_cores // args.max_parallel)
@@ -140,7 +152,7 @@ def main():
     # completes) - written to thread_alloc_path so surviving workers' ThreadAllocPoller
     # (xau.py) can pick up freed cores from configs that finished early.
     active_count = len(configs)
-    thread_alloc_path = os.path.join(args.sweep_dir, "_thread_alloc.json")
+    thread_alloc_path = os.path.join(run_dir, "_thread_alloc.json")
     write_thread_alloc(thread_alloc_path, active_count, logical_cores)
 
     print(f"Launching {len(configs)} config(s), max {args.max_parallel} in parallel, "
@@ -151,7 +163,7 @@ def main():
     results_by_name: Dict[str, Dict[str, Any]] = {}
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_parallel) as executor:
         futures = {
-            executor.submit(run_one, cfg, csv_path, args.sweep_dir, args.seed, num_torch_threads, extra_kwargs, thread_alloc_path): cfg["name"]
+            executor.submit(run_one, cfg, csv_path, run_dir, args.seed, num_torch_threads, extra_kwargs, thread_alloc_path): cfg["name"]
             for cfg in configs
         }
         for future in concurrent.futures.as_completed(futures):
@@ -163,7 +175,7 @@ def main():
                     print(f"[DONE]  {name}: validation net_profit={val.get('net_profit_pct', float('nan')):+.2f}% "
                           f"max_dd={val.get('max_drawdown_pct', float('nan')):.2f}%")
                 else:
-                    print(f"[ERROR] {name}: {result.get('error')}  (see {args.sweep_dir}/{name}/log.txt)")
+                    print(f"[ERROR] {name}: {result.get('error')}  (see {run_dir}/{name}/log.txt)")
             except Exception as e:
                 print(f"[CRASH] {name}: {e}")
                 result = {"config": {"name": name}, "status": "crash", "error": str(e)}
@@ -175,7 +187,7 @@ def main():
     elapsed = time.time() - started_at
     print(f"\nAll runs finished in {elapsed/60:.1f} minutes.")
 
-    with open(os.path.join(args.sweep_dir, "summary.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(run_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(results_by_name, f, indent=2, default=str)
 
     print("\n" + "="*66)
@@ -196,9 +208,10 @@ def main():
         dd_str = f"{dd_pct:.2f}" if dd_pct is not None else "N/A"
         print(f"{name:<20}{np_str:>15}{dd_str:>12}{status:>10}")
     print("="*66)
-    print(f"\nFull per-run logs/results under ./{args.sweep_dir}/<config_name>/")
+    print(f"\nFull per-run logs/results under ./{run_dir}/<config_name>/")
     print("Test-segment metrics are saved in each run's results.json but NOT printed above -")
     print("only look at those for the config chosen from this validation ranking.")
+    print(f"\nFor a follow-up run_seed_sweep.py/ensemble_eval.py call, pass:  --phase1-sweep-dir {run_dir}")
 
 
 if __name__ == "__main__":

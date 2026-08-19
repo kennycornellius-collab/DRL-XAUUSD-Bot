@@ -18,13 +18,25 @@ trained on w's own data (lookahead bias).
 Reporting mirrors every prior era's Phase 1/Phase 2 protocol: validation-only ranking
 between combine methods first, test revealed only for the validation-ranked winner.
 
+--phase1-sweep-dir and --seed-sweep-dir must point at the exact timestamped
+run_sweep.py/run_seed_sweep.py output directories being evaluated (as printed by those
+scripts, e.g. sweep_runs/20260819_195817 and sweep_runs_seeds/20260819_195954) - there
+is no bare-folder default, since a run_id-less "sweep_runs" no longer identifies a
+single run. This script's own output (<winner-name>_ensemble_summary.json) is written
+into --seed-sweep-dir alongside the seeds it evaluated, not a fresh timestamp, since it
+isn't producing new trained artifacts.
+
 Usage:
     # Full 5-seed ensemble, both combine methods
-    python ensemble_eval.py --winner-name 150k_500_256
+    python ensemble_eval.py --winner-name 150k_500_256 \
+        --phase1-sweep-dir sweep_runs/20260819_195817 \
+        --seed-sweep-dir sweep_runs_seeds/20260819_195954
 
     # Single-seed replay check (see plan.md verification step 2) - a 1-seed "ensemble"
     # must reproduce that seed's already-recorded results.json numbers almost exactly
-    python ensemble_eval.py --winner-name 150k_500_256 --seeds 43 --combine mean
+    python ensemble_eval.py --winner-name 150k_500_256 --seeds 43 --combine mean \
+        --phase1-sweep-dir sweep_runs/20260819_195817 \
+        --seed-sweep-dir sweep_runs_seeds/20260819_195954
 """
 import argparse
 import json
@@ -193,8 +205,8 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46])
     parser.add_argument("--combine", choices=["mean", "median", "both"], default="both")
     parser.add_argument("--csv", default=REAL_CSV)
-    parser.add_argument("--phase1-sweep-dir", default="sweep_runs")
-    parser.add_argument("--seed-sweep-dir", default="sweep_runs_seeds")
+    parser.add_argument("--phase1-sweep-dir", required=True, help="Exact timestamped run_sweep.py output directory holding seed 42's checkpoints, e.g. sweep_runs/20260819_195817.")
+    parser.add_argument("--seed-sweep-dir", required=True, help="Exact timestamped run_seed_sweep.py output directory holding seeds 43-46's checkpoints, e.g. sweep_runs_seeds/20260819_195954.")
     parser.add_argument("--pretrain-weeks-count", type=int, default=26)
     parser.add_argument("--val-weeks-count", type=int, default=79)
     parser.add_argument("--min-week-rows", type=int, default=50)
