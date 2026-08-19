@@ -82,12 +82,6 @@ class XAUEnv(gym.Env):
         self._roll_max = roll.max().to_numpy(dtype=np.float32)
         self._hist_step = 0  # index of the last row _append_history() actually wrote
 
-        # Reward's downside-risk window (Sortino-like reward = step_return /
-        # downside_std over this trailing window). 100 and 200 steps were both tried
-        # and reverted (see plan.md Next Priority #3) - both underperformed the
-        # richer-features baseline that this 50-step window itself established.
-        self.returns_50 = collections.deque(maxlen=50)
-
     def current_week_label(self) -> str:
         if self.current_step >= len(self._week_label):
             return self._week_label[-1]
@@ -103,8 +97,6 @@ class XAUEnv(gym.Env):
         self.peak_balance = self.initial_peak_balance
         self.current_unrealized_pnl = 0.0
         self.current_dd = 0.0
-
-        self.returns_50.clear()
 
         self._append_history()
         return self._get_obs(), {"week_label": self.current_week_label()}
@@ -151,7 +143,6 @@ class XAUEnv(gym.Env):
         price_pnl = position_before * (next_close - current_close)
         step_return = price_pnl - spread_cost
         
-        self.returns_50.append(step_return)
         self.balance += step_return
 
         if self.balance > self.peak_balance:
@@ -159,12 +150,17 @@ class XAUEnv(gym.Env):
 
         self.current_dd = (self.peak_balance - self.balance) / self.peak_balance if self.peak_balance > 0 else 0.0
 
-        neg_returns = [r for r in self.returns_50 if r < 0]
-        downside_std = np.std(neg_returns) if len(neg_returns) >= 2 else 1.0
-
-        reward = step_return / (downside_std + 1e-8)
-        if self.current_dd > 0.05:
-            reward -= 0.5 * self.current_dd
+        # Raw dollar step_return - no rolling downside_std normalization and no per-step
+        # drawdown penalty. Both were found to decouple a week's summed reward from its
+        # actual net PnL (sometimes flipping the sign entirely): downside_std was
+        # recomputed every step from a sliding 50-step window, so identical $ moves got
+        # arbitrarily amplified or crushed depending on unrelated recent volatility, and
+        # the old `-0.5 * current_dd` term fired on every step spent underwater
+        # regardless of that step's own outcome (e.g. an intra-week dip-then-recovery
+        # netting a small loss could still rack up a huge cumulative penalty). Reward now
+        # sums to exactly the episode's net PnL by construction, so the training signal
+        # can't disagree with the metric actually being optimized for.
+        reward = step_return
 
         self.position = new_pos
 
