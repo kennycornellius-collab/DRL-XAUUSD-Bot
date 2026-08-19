@@ -82,11 +82,11 @@ class XAUEnv(gym.Env):
         self._roll_max = roll.max().to_numpy(dtype=np.float32)
         self._hist_step = 0  # index of the last row _append_history() actually wrote
 
-        # Widened from 50 (12.5h) to 200 steps (~50h / ~2 days) - matches the observation's
-        # own 200-candle window, and comfortably fits within a single week's WFO episode
-        # so the downside_std estimate below actually has room to stabilize instead of
-        # reacting to whatever handful of bars happened in the last 12.5 hours.
-        self.returns_200 = collections.deque(maxlen=200)
+        # Reward's downside-risk window (Sortino-like reward = step_return /
+        # downside_std over this trailing window). 100 and 200 steps were both tried
+        # and reverted (see plan.md Next Priority #3) - both underperformed the
+        # richer-features baseline that this 50-step window itself established.
+        self.returns_50 = collections.deque(maxlen=50)
 
     def current_week_label(self) -> str:
         if self.current_step >= len(self._week_label):
@@ -104,7 +104,7 @@ class XAUEnv(gym.Env):
         self.current_unrealized_pnl = 0.0
         self.current_dd = 0.0
 
-        self.returns_200.clear()
+        self.returns_50.clear()
 
         self._append_history()
         return self._get_obs(), {"week_label": self.current_week_label()}
@@ -151,7 +151,7 @@ class XAUEnv(gym.Env):
         price_pnl = position_before * (next_close - current_close)
         step_return = price_pnl - spread_cost
         
-        self.returns_200.append(step_return)
+        self.returns_50.append(step_return)
         self.balance += step_return
 
         if self.balance > self.peak_balance:
@@ -159,7 +159,7 @@ class XAUEnv(gym.Env):
 
         self.current_dd = (self.peak_balance - self.balance) / self.peak_balance if self.peak_balance > 0 else 0.0
 
-        neg_returns = [r for r in self.returns_200 if r < 0]
+        neg_returns = [r for r in self.returns_50 if r < 0]
         downside_std = np.std(neg_returns) if len(neg_returns) >= 2 else 1.0
 
         reward = step_return / (downside_std + 1e-8)
@@ -507,6 +507,57 @@ def print_backtest_summary(title: str, metrics: Dict[str, float]) -> None:
     print("="*50 + "\n")
 
 
+def rollout_week(vec_env, predict_fn, week_label: str, on_transition=None) -> Dict[str, Any]:
+    """One deterministic pass over a single week's episode, stepping `vec_env` end-to-end
+    via predict_fn(obs) -> action. Groups steps into trades by position *direction*
+    changes (not exact position equality) - continuous sizing changes the raw position
+    almost every step even while direction is held, so grouping by sign is what keeps "a
+    trade" meaning a directional hold instead of fragmenting into one degenerate trade per
+    step. Mirrors the dir_before/dir_after boundary XAUEnv.step() itself uses for entry
+    costs. Shared by run_wfo_pipeline's training loop (which also feeds transitions to its
+    replay buffer via on_transition) and any inference-only replay - e.g. ensemble_eval.py
+    - that doesn't train, so the two paths can't silently drift apart."""
+    obs = vec_env.reset()
+    done = False
+    ep_reward = 0.0
+    ep_pnl = 0.0
+    trades: List[Dict[str, Any]] = []
+    current_trade: Optional[Dict[str, Any]] = None
+    last_info: Dict[str, Any] = {}
+
+    while not done:
+        action = predict_fn(obs)
+        next_obs, rewards, dones, infos = vec_env.step(action)
+        if on_transition is not None:
+            on_transition(obs, next_obs, action, rewards, dones, infos)
+
+        ep_reward += rewards[0]
+        ep_pnl += infos[0]['step_pnl']
+
+        pos_before = infos[0]['position_before']
+        pos_after = infos[0]['position_after']
+        dir_before = np.sign(pos_before)
+        dir_after = np.sign(pos_after)
+        if dir_before != 0 and current_trade is not None:
+            current_trade['pnl'] += infos[0]['price_pnl']
+            current_trade['duration'] += 1
+        if dir_after != dir_before:
+            if current_trade is not None:
+                trades.append(current_trade)
+                current_trade = None
+            if dir_after != 0:
+                current_trade = {"week": week_label, "direction": int(dir_after), "pnl": -infos[0]['spread_cost'], "duration": 0}
+
+        obs = next_obs
+        done = dones[0]
+        last_info = infos[0]
+
+    if current_trade is not None:
+        trades.append(current_trade)
+
+    return {"ep_reward": ep_reward, "ep_pnl": ep_pnl, "trades": trades, "last_info": last_info}
+
+
 def run_wfo_pipeline(
     csv_path: str,
     pretrain_weeks_count: int = 26,
@@ -594,48 +645,18 @@ def run_wfo_pipeline(
         # env's own drawdown penalty and 20% hard stop react to true cumulative
         # equity (matching mt5bridge.py's PEAK_BALANCE) instead of each week in isolation.
         wf_env = DummyVecEnv([lambda: XAUEnv(w_df, initial_balance=oos_equity_curve[-1], initial_peak_balance=running_peak_balance)])
-        obs = wf_env.reset()
-        done = False
-
-        ep_reward = 0.0
-        ep_pnl = 0.0
         loop_start = time.time()
-        current_trade: Optional[Dict[str, Any]] = None
 
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            next_obs, rewards, dones, infos = wf_env.step(action)
-            model.replay_buffer.add(obs, next_obs, action, rewards, dones, infos)
-
-            ep_reward += rewards[0]
-            ep_pnl += infos[0]['step_pnl']
-
-            # Attribute this bar's price move to whichever trade was open going into it,
-            # and open/close trades on *direction* changes (flat<->position or a direct
-            # reversal) rather than exact position equality - with continuous sizing the
-            # raw position value changes almost every step even while direction is held,
-            # so grouping by sign is what keeps "a trade" meaning a directional hold
-            # instead of fragmenting into one degenerate trade per step. Mirrors the
-            # dir_before/dir_after boundary XAUEnv.step() itself uses for entry costs.
-            pos_before = infos[0]['position_before']
-            pos_after = infos[0]['position_after']
-            dir_before = np.sign(pos_before)
-            dir_after = np.sign(pos_after)
-            if dir_before != 0 and current_trade is not None:
-                current_trade['pnl'] += infos[0]['price_pnl']
-                current_trade['duration'] += 1
-            if dir_after != dir_before:
-                if current_trade is not None:
-                    trades.append(current_trade)
-                    current_trade = None
-                if dir_after != 0:
-                    current_trade = {"week": w, "direction": int(dir_after), "pnl": -infos[0]['spread_cost'], "duration": 0}
-
-            obs = next_obs
-            done = dones[0]
-
-        if current_trade is not None:
-            trades.append(current_trade)
+        rollout = rollout_week(
+            wf_env,
+            predict_fn=lambda obs: model.predict(obs, deterministic=True)[0],
+            week_label=w,
+            on_transition=lambda obs, next_obs, action, rewards, dones, infos: model.replay_buffer.add(obs, next_obs, action, rewards, dones, infos),
+        )
+        ep_reward = rollout["ep_reward"]
+        ep_pnl = rollout["ep_pnl"]
+        trades.extend(rollout["trades"])
+        last_info = rollout["last_info"]
 
         start_of_week_balance = oos_equity_curve[-1]
         weekly_pnl.append(ep_pnl)
@@ -646,7 +667,7 @@ def run_wfo_pipeline(
         new_balance = oos_equity_curve[-1] + ep_pnl
         oos_equity_curve.append(new_balance)
         equity_curve_weeks.append(w)
-        running_peak_balance = infos[0]['peak_balance']
+        running_peak_balance = last_info['peak_balance']
 
         if len(model.replay_buffer.week_index_map) > replay_window_weeks:
             model.replay_buffer.purge_oldest_week()
